@@ -511,7 +511,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
     std::vector<float> logits;
     if (num_batches > 1) {
-        logits.reserve(size_t(n_ctx) * n_vocab);
+        logits.reserve(size_t(n_batch) * n_vocab);
     }
 
     LOG_INF("%s: calculating perplexity over %d chunks, n_ctx=%d, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
@@ -869,8 +869,7 @@ static void hellaswag_score(llama_context * ctx, const common_params & params) {
     llama_batch batch = llama_batch_init(n_ctx, 0, 4);
 
     std::vector<float> tok_logits(n_vocab);
-    // TODO: this could be made smaller; it's currently the worst-case size
-    std::vector<float> batch_logits(size_t(n_ctx)*n_vocab);
+    std::vector<float> batch_logits;
 
     std::vector<std::pair<size_t, llama_token>> eval_pairs;
     std::vector<float> eval_results;
@@ -928,6 +927,8 @@ static void hellaswag_score(llama_context * ctx, const common_params & params) {
         }
 
         llama_memory_clear(llama_get_memory(ctx), true);
+
+        batch_logits.resize(size_t(i_logits) * n_vocab);
 
         // decode all tasks [i0, i1)
         if (!decode_helper(ctx, batch, batch_logits, n_batch, n_vocab)) {
@@ -1167,8 +1168,7 @@ static void winogrande_score(llama_context * ctx, const common_params & params) 
     llama_batch batch = llama_batch_init(n_ctx, 0, 2);
 
     std::vector<float> tok_logits(n_vocab);
-    // TODO: this could be made smaller; it's currently the worst-case size
-    std::vector<float> batch_logits(size_t(n_ctx)*n_vocab);
+    std::vector<float> batch_logits;
 
     std::vector<std::pair<size_t, llama_token>> eval_pairs;
     std::vector<float> eval_results;
@@ -1221,6 +1221,8 @@ static void winogrande_score(llama_context * ctx, const common_params & params) 
         }
 
         llama_memory_clear(llama_get_memory(ctx), true);
+
+        batch_logits.resize(size_t(i_logits) * n_vocab);
 
         // decode all tasks [i0, i1)
         if (!decode_helper(ctx, batch, batch_logits, n_batch, n_vocab)) {
@@ -1521,7 +1523,7 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
     llama_batch batch = llama_batch_init(n_ctx, 0, max_seq);
 
     std::vector<float> tok_logits(n_vocab);
-    std::vector<float> batch_logits(size_t(n_ctx)*n_vocab);
+    std::vector<float> batch_logits;
 
     std::vector<std::pair<size_t, llama_token>> eval_pairs;
     std::vector<float> eval_results;
@@ -1600,6 +1602,8 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
         }
 
         llama_memory_clear(llama_get_memory(ctx), true);
+
+        batch_logits.resize(size_t(i_logits) * n_vocab);
 
         // decode all tasks [i0, i1)
         if (!decode_helper(ctx, batch, batch_logits, n_batch, n_vocab)) {
@@ -1760,7 +1764,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     std::vector<float> p_diff_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
     std::vector<float> logits;
     if (num_batches > 1) {
-        logits.reserve(size_t(n_ctx) * n_vocab);
+        logits.reserve(size_t(n_batch) * n_vocab);
     }
 
     LOG_INF("%s: computing over %d chunks, n_ctx=%u, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
