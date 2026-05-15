@@ -85,6 +85,22 @@ static bool common_dflash_gpu_ring_env_enabled() {
     return env == nullptr || std::atoi(env) != 0;
 }
 
+static bool common_dflash_force_cpu_cross_ring() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_DFLASH_FORCE_CPU_CROSS");
+        return e && e[0] != '\0' && std::strcmp(e, "0") != 0;
+    }();
+    return v;
+}
+
+static bool common_dflash_log_contract_verbose() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_DFLASH_VERBOSE_CONTRACT");
+        return e && e[0] != '\0' && std::strcmp(e, "0") != 0;
+    }();
+    return v;
+}
+
 static bool common_dflash_gpu_ring_allowed(llama_context * ctx_tgt, llama_context * ctx_dft) {
     if (!common_dflash_gpu_ring_env_enabled()) {
         LOG_INF("dflash: GPU cross ring disabled by GGML_DFLASH_GPU_RING=0; using CPU hidden capture\n");
@@ -1720,16 +1736,24 @@ struct common_speculative_state_dflash : public common_speculative_state {
         // Try to allocate the GPU ring only when both contexts can safely share
         // single-backend cross tensors. Otherwise keep the target eval callback
         // active so the CPU ring fallback has hidden states to consume.
-        const bool gpu_ring_requested = common_dflash_gpu_ring_allowed(ctx_tgt, ctx_dft);
+        const bool gpu_ring_allowed = common_dflash_gpu_ring_allowed(ctx_tgt, ctx_dft);
+        const bool gpu_ring_forced_off = common_dflash_force_cpu_cross_ring();
+        const bool gpu_ring_requested = gpu_ring_allowed && !gpu_ring_forced_off;
+
         llama_set_dflash_gpu_capture(ctx_tgt, gpu_ring_requested);
 
-        LOG_INF("dflash: GPU hidden capture policy: requested=%d target_devices=%d drafter_devices=%d\n",
+        LOG_INF("dflash: GPU hidden capture policy: allowed=%d forced_cpu=%d requested=%d target_devices=%d drafter_devices=%d\n",
+                gpu_ring_allowed ? 1 : 0,
+                gpu_ring_forced_off ? 1 : 0,
                 gpu_ring_requested ? 1 : 0,
                 llama_model_n_devices(llama_get_model(ctx_tgt)),
                 llama_model_n_devices(model_dft));
 
         if (gpu_ring_requested) {
             gpu_ring_handle = llama_dflash_cross_ring_gpu_init(ctx_dft, n_target_layers, n_embd, cross_ctx);
+        }
+        if (gpu_ring_forced_off) {
+            LOG_INF("dflash: GPU cross ring forced off by GGML_DFLASH_FORCE_CPU_CROSS; using CPU hidden capture\n");
         }
         if (gpu_ring_handle) {
             LOG_INF("dflash: GPU cross ring enabled (%d layers x %d slots x %d embd)\n",
