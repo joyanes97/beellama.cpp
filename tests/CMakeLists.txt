@@ -314,6 +314,12 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 llama_build_and_test(test-alloc.cpp)
 target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
+# op coverage test: catches enum/name/symbol table drift before release
+add_executable(test-ggml-op-coverage test-ggml-op-coverage.cpp)
+target_include_directories(test-ggml-op-coverage PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include)
+target_link_libraries(test-ggml-op-coverage PRIVATE ggml)
+add_test(NAME test-ggml-op-coverage COMMAND test-ggml-op-coverage)
+
 llama_build(export-graph-ops.cpp)
 target_include_directories(export-graph-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 if (TARGET gguf-model-data)

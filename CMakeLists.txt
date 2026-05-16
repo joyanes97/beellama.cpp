@@ -128,6 +128,9 @@ endif()
 if (NOT DEFINED LLAMA_BUILD_COMMIT)
     set(LLAMA_BUILD_COMMIT        ${BUILD_COMMIT})
 endif()
+if (NOT DEFINED LLAMA_BUILD_DIRTY)
+    set(LLAMA_BUILD_DIRTY         ${BUILD_DIRTY})
+endif()
 set(LLAMA_INSTALL_VERSION 0.0.${LLAMA_BUILD_NUMBER})
 
 # override ggml options
