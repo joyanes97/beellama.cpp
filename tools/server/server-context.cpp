@@ -4480,10 +4480,12 @@ private:
                 int src_offset_for_flush = 0;
                 (void)src_offset_for_flush;
 
-                int written = common_speculative_flush_prefill(pf.spec, 0, pf.span.n_tokens);
+                const int written = common_speculative_flush_prefill(pf.spec, 0, pf.span.n_tokens);
                 if (written != pf.span.n_tokens) {
-                    SRV_ERR("dflash prefill flush mismatch: slot=%d requested=%d written=%d src_offset=0\n",
+                    SRV_ERR("dflash prefill flush mismatch: slot=%d requested=%d written=%d src_offset=0; disabling DFlash drafting until fresh hiddens are available\n",
                             pf.slot_id, pf.span.n_tokens, written);
+
+                    common_speculative_set_prefill_capture_enabled(pf.spec, false);
                 }
             }
 
