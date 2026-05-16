@@ -551,6 +551,10 @@ int main(int argc, char ** argv) {
         "dflash_capture_data must declare prefill capture plan struct");
     ok &= expect(context_h.find("prefill_plan") != std::string::npos,
         "dflash_capture_data must include prefill_plan field");
+    ok &= expect(context_h.find("std::vector<dflash_prefill_capture_plan> prefill_plans") != std::string::npos,
+        "dflash_capture_data must keep prefill capture plans per slot/seq");
+    ok &= expect(context_h.find("dflash_prefill_capture_plan prefill_plan;") == std::string::npos,
+        "dflash_capture_data must not use one global prefill capture plan");
     ok &= expect(context_h.find("dflash_prefill_capture_begin") != std::string::npos,
         "llama_context must declare prefill capture begin method");
     ok &= expect(context_h.find("dflash_prefill_capture_end") != std::string::npos,
@@ -577,9 +581,9 @@ int main(int argc, char ** argv) {
     // Prefill capture plan: n_written tracking and plan reset
     ok &= expect(context_h.find("n_written") != std::string::npos,
         "prefill capture plan must track n_written");
-    ok &= expect(context_cpp.find("prefill_plan.n_written = 0") != std::string::npos,
+    ok &= expect(context_cpp.find("plan.n_written = 0") != std::string::npos,
         "capture begin must reset n_written to 0");
-    ok &= expect(context_cpp.find("prefill_plan.n_written") != std::string::npos,
+    ok &= expect(context_cpp.find("plan.n_written") != std::string::npos,
         "decode loop must advance n_written after graph copy");
 
     // CParams intersection offsets for graph builder
@@ -591,6 +595,12 @@ int main(int argc, char ** argv) {
         "cparams must declare prefill dst_offset");
     ok &= expect(cparams_h.find("dflash_prefill_n_tokens") != std::string::npos,
         "cparams must declare prefill n_tokens");
+    ok &= expect(cparams_h.find("dflash_prefill_src_offsets") != std::string::npos,
+        "cparams must declare per-seq prefill src offsets for multi-slot capture");
+    ok &= expect(cparams_h.find("dflash_prefill_dst_offsets") != std::string::npos,
+        "cparams must declare per-seq prefill dst offsets for multi-slot capture");
+    ok &= expect(cparams_h.find("dflash_prefill_n_tokens_seqs") != std::string::npos,
+        "cparams must declare per-seq prefill token counts for multi-slot capture");
     ok &= expect(graph_h.find("dflash_prefill_capture_active") != std::string::npos,
         "graph reuse must key on prefill capture active flag");
     ok &= expect(graph_h.find("dflash_prefill_n_tokens") != std::string::npos,
@@ -599,16 +609,24 @@ int main(int argc, char ** argv) {
     // Graph builders must use intersection offsets
     ok &= expect(qwen35.find("dflash_prefill_capture_active") != std::string::npos,
         "Qwen3.5 graph builder must check prefill capture active");
-    ok &= expect(qwen35.find("dflash_prefill_src_offset") != std::string::npos,
-        "Qwen3.5 graph builder must use prefill src_offset");
-    ok &= expect(qwen35.find("dflash_prefill_dst_offset") != std::string::npos,
-        "Qwen3.5 graph builder must use prefill dst_offset");
+    ok &= expect(qwen35.find("dflash_prefill_src_offsets[s]") != std::string::npos,
+        "Qwen3.5 graph builder must use per-seq prefill src offsets");
+    ok &= expect(qwen35.find("dflash_prefill_dst_offsets[s]") != std::string::npos,
+        "Qwen3.5 graph builder must use per-seq prefill dst offsets");
+    ok &= expect(qwen35.find("dflash_prefill_n_tokens_seqs[s]") != std::string::npos,
+        "Qwen3.5 graph builder must use per-seq prefill token counts");
+    ok &= expect(qwen35.find(": cparams.dflash_prefill_n_tokens") == std::string::npos,
+        "Qwen3.5 graph builder must not fall back to scalar prefill token count for zero-copy seqs");
     ok &= expect(qwen35moe.find("dflash_prefill_capture_active") != std::string::npos,
         "Qwen3.5-MoE graph builder must check prefill capture active");
-    ok &= expect(qwen35moe.find("dflash_prefill_src_offset") != std::string::npos,
-        "Qwen3.5-MoE graph builder must use prefill src_offset");
-    ok &= expect(qwen35moe.find("dflash_prefill_dst_offset") != std::string::npos,
-        "Qwen3.5-MoE graph builder must use prefill dst_offset");
+    ok &= expect(qwen35moe.find("dflash_prefill_src_offsets[s]") != std::string::npos,
+        "Qwen3.5-MoE graph builder must use per-seq prefill src offsets");
+    ok &= expect(qwen35moe.find("dflash_prefill_dst_offsets[s]") != std::string::npos,
+        "Qwen3.5-MoE graph builder must use per-seq prefill dst offsets");
+    ok &= expect(qwen35moe.find("dflash_prefill_n_tokens_seqs[s]") != std::string::npos,
+        "Qwen3.5-MoE graph builder must use per-seq prefill token counts");
+    ok &= expect(qwen35moe.find(": cparams.dflash_prefill_n_tokens") == std::string::npos,
+        "Qwen3.5-MoE graph builder must not fall back to scalar prefill token count for zero-copy seqs");
 
     // Server must call capture_begin and capture_end
     ok &= expect(server_context.find("llama_dflash_prefill_capture_begin") != std::string::npos,
@@ -622,9 +640,11 @@ int main(int argc, char ** argv) {
     ok &= expect(speculative.find("capture_info") != std::string::npos,
         "flush_prefill must reference capture_info for n_written");
 
-    // GPU staging flush must be window-relative (offset=0)
-    ok &= expect(server_context.find("common_speculative_flush_prefill(pf.spec, 0,") != std::string::npos,
-        "server must flush with offset=0 for GPU staging");
+    // Server should pass the planned source offset. GPU staging normalizes to
+    // window-relative offset 0 inside flush_prefill(), while CPU fallback needs
+    // the original sub-batch offset.
+    ok &= expect(server_context.find("common_speculative_flush_prefill(pf.spec, pf.span.src_offset,") != std::string::npos,
+        "server must pass planned source offset to prefill flush");
 
     // Decode loop must compute intersection offsets
     ok &= expect(context_cpp.find("inter_begin") != std::string::npos,
@@ -637,7 +657,7 @@ int main(int argc, char ** argv) {
         "decode loop must set cparams.dflash_prefill_dst_offset");
 
     // Prefill GPU allocation must use plan size, not ubatch size
-    ok &= expect(context_cpp.find("prefill_plan.n_tokens") != std::string::npos,
+    ok &= expect(context_cpp.find("max_prefill_plan_tokens") != std::string::npos,
         "decode loop must allocate prefill GPU based on plan n_tokens");
 
     // Graph reuse must key on prefill intersection offsets
@@ -669,10 +689,14 @@ int main(int argc, char ** argv) {
         "Gemma4 graph builder must check prefill_gpu_n_seqs");
     ok &= expect(gemma4_iswa.find("dflash_prefill_capture_active") != std::string::npos,
         "Gemma4 graph builder must check dflash_prefill_capture_active");
-    ok &= expect(gemma4_iswa.find("dflash_prefill_src_offset") != std::string::npos,
-        "Gemma4 graph builder must use prefill src_offset");
-    ok &= expect(gemma4_iswa.find("dflash_prefill_dst_offset") != std::string::npos,
-        "Gemma4 graph builder must use prefill dst_offset");
+    ok &= expect(gemma4_iswa.find("dflash_prefill_src_offsets[s]") != std::string::npos,
+        "Gemma4 graph builder must use per-seq prefill src offsets");
+    ok &= expect(gemma4_iswa.find("dflash_prefill_dst_offsets[s]") != std::string::npos,
+        "Gemma4 graph builder must use per-seq prefill dst offsets");
+    ok &= expect(gemma4_iswa.find("dflash_prefill_n_tokens_seqs[s]") != std::string::npos,
+        "Gemma4 graph builder must use per-seq prefill token counts");
+    ok &= expect(gemma4_iswa.find(": cparams.dflash_prefill_n_tokens") == std::string::npos,
+        "Gemma4 graph builder must not fall back to scalar prefill token count for zero-copy seqs");
 
     // flush_prefill must use source-first (prefill_gpu check before CPU validation)
     ok &= expect(speculative.find("use_prefill_gpu && !validate_target_hiddens") != std::string::npos
@@ -716,6 +740,20 @@ int main(int argc, char ** argv) {
     // Mismatch in server must disable DFlash drafting
     ok &= expect(server_context.find("common_speculative_set_prefill_capture_enabled(pf.spec, false)") != std::string::npos,
         "prefill flush mismatch must disable DFlash capture for the affected slot");
+
+    ok &= expect(speculative_h.find("common_speculative_note_prefill_suffix_scheduled") != std::string::npos,
+        "DFlash must expose a separate prefill-suffix scheduled marker");
+    ok &= expect(speculative.find("note_prefill_suffix_scheduled") != std::string::npos,
+        "DFlash state must implement a separate prefill-suffix scheduled marker");
+    ok &= expect(server_context.find("common_speculative_note_prefill_suffix_scheduled(slot.spec.get())") != std::string::npos,
+        "server must mark only slots with a scheduled suffix prefill");
+    {
+        const size_t fn = speculative.find("void set_prefill_capture_enabled(bool enabled) override");
+        const size_t end = fn == std::string::npos ? std::string::npos : speculative.find("void note_prefill_suffix_scheduled() override", fn);
+        const std::string body = (fn == std::string::npos || end == std::string::npos) ? "" : speculative.substr(fn, end - fn);
+        ok &= expect(body.find("prefill_suffix_seen = true") == std::string::npos,
+            "generic capture enable must not mark every DFlash slot as having scheduled suffix prefill");
+    }
 
     // CPU ring validity state machine
     ok &= expect(!common_dflash_cpu_ring_valid_after_write_for_test(true,  false, true,  false),
