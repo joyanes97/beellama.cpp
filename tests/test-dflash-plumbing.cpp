@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "dflash-profile.h"
 #include "speculative.h"
 
 #include <cstdio>
@@ -53,6 +54,7 @@ int main(int argc, char ** argv) {
     const std::string root = argv[1];
     const std::string context_h = read_file(root + "/src/llama-context.h");
     const std::string context_cpp = read_file(root + "/src/llama-context.cpp");
+    const std::string dflash_profile_h = read_file(root + "/src/dflash-profile.h");
     const std::string cparams_h = read_file(root + "/src/llama-cparams.h");
     const std::string graph_cpp = read_file(root + "/src/llama-graph.cpp");
     const std::string llama_h = read_file(root + "/include/llama.h");
@@ -96,6 +98,25 @@ int main(int argc, char ** argv) {
     const std::string cuda_fattn_vec_turbo3_tcq_q8_0 = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-turbo3_tcq-q8_0.cu");
     const std::string cuda_fattn_vec_turbo3_tcq_turbo3_tcq = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-turbo3_tcq-turbo3_tcq.cu");
     const std::string cuda_template_generator = read_file(root + "/ggml/src/ggml-cuda/template-instances/generate_cu_files.py");
+
+    ok &= expect(dflash_profile_parse_env(nullptr) == 0, "DFlash profile parser must treat missing env as disabled");
+    ok &= expect(dflash_profile_parse_env("0") == 0, "DFlash profile parser must treat 0 as disabled");
+    ok &= expect(dflash_profile_parse_env("off") == 0, "DFlash profile parser must treat off as disabled");
+    ok &= expect((dflash_profile_parse_env("1") & DFLASH_PROFILE_DEFAULT) == DFLASH_PROFILE_DEFAULT,
+        "DFlash profile parser must keep GGML_DFLASH_PROFILE=1 as the default useful profile set");
+    ok &= expect((dflash_profile_parse_env("1") & DFLASH_PROFILE_TRACE) == 0,
+        "DFlash profile parser must not enable trace firehose for GGML_DFLASH_PROFILE=1");
+    ok &= expect(dflash_profile_parse_env("replay,copy,prefill") ==
+            (DFLASH_PROFILE_REPLAY | DFLASH_PROFILE_COPY | DFLASH_PROFILE_PREFILL),
+        "DFlash profile parser must accept comma-separated profile categories");
+    ok &= expect(dflash_profile_parse_env("summary replay verify") ==
+            (DFLASH_PROFILE_SUMMARY | DFLASH_PROFILE_REPLAY | DFLASH_PROFILE_VERIFY),
+        "DFlash profile parser must accept whitespace-separated profile categories");
+    ok &= expect(dflash_profile_parse_env("all") == DFLASH_PROFILE_ALL,
+        "DFlash profile parser must support all profile categories");
+    ok &= expect(dflash_profile_h.find("DFLASH_PROFILE_PREFILL") != std::string::npos &&
+                 dflash_profile_h.find("DFLASH_PROFILE_TRACE") != std::string::npos,
+        "DFlash profile categories must be centralized in dflash-profile.h");
 
     const size_t pretranspose = qwen35moe.find("\"qkv_mixed_pretranspose\"");
     const size_t transpose    = qwen35moe.find("qkv_mixed = ggml_transpose(ctx0, qkv_mixed)");
@@ -236,7 +257,7 @@ int main(int argc, char ** argv) {
     ok &= expect(context_cpp.find("std::swap(logits_argmax_prob_buf") != std::string::npos, "output reordering must include reduced logits probabilities");
     ok &= expect(qwen35.find("ggml_build_forward_expand(gf, ggml_cpy(ctx0, qkv_cont, qkv_dst))") != std::string::npos, "Qwen3.5 must graph-copy QKV into GPU tape");
     ok &= expect(qwen35moe.find("ggml_build_forward_expand(gf, ggml_cpy(ctx0, qkv_cont, qkv_dst))") != std::string::npos, "Qwen3.5-MoE must graph-copy QKV into GPU tape");
-    ok &= expect(speculative.find("GGML_DFLASH_PROFILE") != std::string::npos, "DFlash speculative path must honor profiling flag");
+    ok &= expect(dflash_profile_h.find("GGML_DFLASH_PROFILE") != std::string::npos, "DFlash profile helper must honor profiling flag");
     ok &= expect(speculative.find("gpu_sync=%.3f ms") != std::string::npos, "DFlash ring profiling must report GPU sync time");
     ok &= expect(speculative.find("kv_cache_update requested=%d update=%d") != std::string::npos, "DFlash accept profiling must report drafter K/V cache update time");
     ok &= expect(context_h.find("struct dflash_hidden_gpu") != std::string::npos, "DFlash must define GPU hidden capture storage");
@@ -478,6 +499,11 @@ int main(int argc, char ** argv) {
         "server must log one reduced-verifier batch decision behind GGML_DFLASH_PROFILE");
     ok &= expect(server_context.find("dflash compact-output mismatch:") != std::string::npos,
         "server must log reduced verifier compact-output mismatches behind GGML_DFLASH_PROFILE");
+    ok &= expect(server_context.find("DFLASH_PROFILE_VERIFY") != std::string::npos &&
+                 server_context.find("DFLASH_PROFILE_PREFILL") != std::string::npos &&
+                 speculative.find("DFLASH_PROFILE_COPY") != std::string::npos &&
+                 context_cpp.find("DFLASH_PROFILE_TRACE") != std::string::npos,
+        "DFlash profile logging must use profile categories instead of one broad boolean gate");
     ok &= expect(server_context.find("dflash_slot_in_view") != std::string::npos,
         "server must share DFlash slot-in-view detection between per-view scans");
     {

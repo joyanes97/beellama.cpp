@@ -16,6 +16,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "src/dflash-profile.h"
 #include "src/llama-memory.h"
 
 #include <algorithm>
@@ -43,12 +44,8 @@
 
 using json = nlohmann::ordered_json;
 
-static bool dflash_server_profile_enabled() {
-    static const bool enabled = []() {
-        const char * env = std::getenv("GGML_DFLASH_PROFILE");
-        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
+static bool dflash_server_profile_enabled(uint32_t flags) {
+    return dflash_profile_enabled(flags);
 }
 
 static bool server_tail_pos_is_in_code_fence(
@@ -1251,7 +1248,7 @@ static void dflash_log_reduced_verify_decision(
         int32_t     n_tokens,
         int         top_k,
         const char * reason) {
-    if (!dflash_server_profile_enabled()) {
+    if (!dflash_server_profile_enabled(DFLASH_PROFILE_VERIFY)) {
         return;
     }
 
@@ -3483,7 +3480,8 @@ private:
         uint64_t recurrent_backup_fallback = 0;
         uint64_t recurrent_backup_enqueue_us = 0;
         uint64_t recurrent_backup_sync_us = 0;
-        const bool profile_dflash_cycle = dflash_server_profile_enabled();
+        const bool profile_dflash_cycle = dflash_server_profile_enabled(
+                DFLASH_PROFILE_SUMMARY | DFLASH_PROFILE_REPLAY | DFLASH_PROFILE_COPY);
         auto dflash_profile_start = [&]() -> int64_t {
             return profile_dflash_cycle ? ggml_time_us() : 0;
         };
@@ -4534,7 +4532,7 @@ private:
 
             if (batch_end <= capture_from) {
                 // This sub-batch is entirely before the useful suffix — skip it.
-                if (log_decision && dflash_server_profile_enabled()) {
+                if (log_decision && dflash_server_profile_enabled(DFLASH_PROFILE_PREFILL)) {
                     SLT_INF(slot,
                             "dflash prefill: skip flush, batch_pos=[%d,%d], batch_end=%d, prompt_total=%d, cross_ctx=%d, capture_from=%d\n",
                             (int) batch_pos_min, (int) batch_pos_max, batch_end, prompt_total, cross_ctx, capture_from);
@@ -4565,7 +4563,7 @@ private:
             span.src_offset   = src_offset;
             span.n_tokens     = n_tokens;
 
-            if (log_decision && dflash_server_profile_enabled()) {
+            if (log_decision && dflash_server_profile_enabled(DFLASH_PROFILE_PREFILL)) {
                 SLT_INF(slot,
                         "dflash prefill: suffix flush, batch_pos=[%d,%d], batch_end=%d, prompt_total=%d, cross_ctx=%d, capture_from=%d, capture_begin=%d, capture_end=%d, src_offset=%d, n_tokens=%d\n",
                         (int) batch_pos_min, (int) batch_pos_max, batch_end, prompt_total, cross_ctx, capture_from, span.capture_begin, span.capture_end, span.src_offset, span.n_tokens);
@@ -4664,19 +4662,19 @@ private:
 
                 // Log scheduled flushes for this view
                 for (auto & pf : pending_prefill_flushes) {
-                    if (dflash_server_profile_enabled()) {
+                    if (dflash_server_profile_enabled(DFLASH_PROFILE_PREFILL)) {
                         SRV_INF("dflash prefill schedule: slot=%d capture_begin=%d capture_end=%d src_offset=%d n_tokens=%d\n",
                                 pf.slot_id, pf.span.capture_begin, pf.span.capture_end, pf.span.src_offset, pf.span.n_tokens);
                     }
                 }
 
-                if (dflash_server_profile_enabled()) {
+                if (dflash_server_profile_enabled(DFLASH_PROFILE_PREFILL)) {
                     SRV_INF("dflash prefill capture: view_start=%d n_tokens=%d enabled=%d\n",
                             i, n_tokens, dflash_capture_needed_for_view ? 1 : 0);
                 }
             }
 
-            if (dflash_server_profile_enabled() &&
+            if (dflash_server_profile_enabled(DFLASH_PROFILE_PREFILL | DFLASH_PROFILE_VERIFY) &&
                     params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH &&
                     dflash_view_has_unexpected_prompt_logits(batch_view, slots)) {
                 SRV_INF("dflash prompt logits diagnostic: view_start=%d n_tokens=%d has unexpected prompt raw logits outside final sampling row\n",
@@ -4695,7 +4693,7 @@ private:
                     dflash_reduced_verify_ready = true;
                     dflash_reduced_verify_top_k = dflash_verify_plan.top_k;
                     dflash_reduced_verify_view_start = i;
-                } else if (dflash_server_profile_enabled()) {
+                } else if (dflash_server_profile_enabled(DFLASH_PROFILE_VERIFY)) {
                     SRV_INF("dflash compact-output mismatch: view_start=%d n_tokens=%d expected_top_k=%d got_ptr=%d got_n=%d got_k=%d\n",
                             i, n_tokens, dflash_verify_plan.top_k,
                             compact_argmax != nullptr ? 1 : 0, compact_n, compact_k);
@@ -4938,7 +4936,7 @@ private:
                 const bool is_draft_tree = slot.has_draft_tree;
                 const size_t n_draft = is_draft_tree ? (size_t) slot.draft_tree.n_nodes : slot.spec_draft.size();
                 const bool had_dflash_padding = !slot.spec_pad_i_batch.empty();
-                const bool profile_dflash_accept = dflash_server_profile_enabled() &&
+                const bool profile_dflash_accept = dflash_server_profile_enabled(DFLASH_PROFILE_SUMMARY | DFLASH_PROFILE_COPY) &&
                         params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH;
                 const int64_t profile_accept_start = profile_dflash_accept ? ggml_time_us() : 0;
                 int64_t profile_accept_phase_start = profile_accept_start;

@@ -12,6 +12,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
+#include "dflash-profile.h"
 #include "llama.h"
 
 #include "ggml-alloc.h"
@@ -1096,14 +1097,6 @@ static void dflash_read_tensor(struct ggml_tensor * t, std::vector<float> & dst,
     dflash_read_tensor_to(t, dst.data(), n_floats);
 }
 
-static bool dflash_profile_enabled() {
-    static const bool enabled = [] {
-        const char * env = std::getenv("GGML_DFLASH_PROFILE");
-        return env && std::atoi(env) != 0;
-    }();
-    return enabled;
-}
-
 static bool dflash_diagnostic_debug_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_DFLASH_DEBUG");
@@ -1174,37 +1167,40 @@ static void dflash_profile_log(const dflash_capture_data & cap, const char * fun
     const uint64_t skipped_bytes_est =
         cap.profile_raw_logits_skipped * (uint64_t) std::max(0, n_vocab) * sizeof(float);
 
-    LLAMA_LOG_INFO(
-        "%s: dflash profile: decode=%.3f ms output_extract=%.3f ms "
-        "raw_logits=%.3f ms raw_logits_bytes=%.3f MiB raw_logits_skipped=%" PRIu64
-        " raw_logits_skipped_bytes_est=%.3f MiB "
-        "reduced_logits=%.3f ms reduced_logits_bytes=%.3f KiB "
-        "cb ask=%" PRIu64 " hidden=%" PRIu64 " tape=%" PRIu64 " qkv=%" PRIu64
-        " read=%" PRIu64 " hidden=%" PRIu64 " tape=%" PRIu64 " qkv=%" PRIu64 "\n",
-        func,
-        cap.profile_decode_us / 1000.0,
-        cap.profile_output_extract_us / 1000.0,
-        cap.profile_raw_logits_us / 1000.0,
-        cap.profile_raw_logits_bytes / (1024.0 * 1024.0),
-        cap.profile_raw_logits_skipped,
-        skipped_bytes_est / (1024.0 * 1024.0),
-        cap.profile_reduced_logits_us / 1000.0,
-        cap.profile_reduced_logits_bytes / 1024.0,
-        cap.profile_cb_ask,
-        cap.profile_cb_hidden_ask,
-        cap.profile_cb_tape_ask,
-        cap.profile_cb_qkv_ask,
-        cap.profile_cb_read,
-        cap.profile_cb_hidden_read,
-        cap.profile_cb_tape_read,
-        cap.profile_cb_qkv_read);
+    if (dflash_profile_has(cap.profile_flags, DFLASH_PROFILE_SUMMARY | DFLASH_PROFILE_VERIFY)) {
+        LLAMA_LOG_INFO(
+            "%s: dflash profile: decode=%.3f ms output_extract=%.3f ms "
+            "raw_logits=%.3f ms raw_logits_bytes=%.3f MiB raw_logits_skipped=%" PRIu64
+            " raw_logits_skipped_bytes_est=%.3f MiB "
+            "reduced_logits=%.3f ms reduced_logits_bytes=%.3f KiB "
+            "cb ask=%" PRIu64 " hidden=%" PRIu64 " tape=%" PRIu64 " qkv=%" PRIu64
+            " read=%" PRIu64 " hidden=%" PRIu64 " tape=%" PRIu64 " qkv=%" PRIu64 "\n",
+            func,
+            cap.profile_decode_us / 1000.0,
+            cap.profile_output_extract_us / 1000.0,
+            cap.profile_raw_logits_us / 1000.0,
+            cap.profile_raw_logits_bytes / (1024.0 * 1024.0),
+            cap.profile_raw_logits_skipped,
+            skipped_bytes_est / (1024.0 * 1024.0),
+            cap.profile_reduced_logits_us / 1000.0,
+            cap.profile_reduced_logits_bytes / 1024.0,
+            cap.profile_cb_ask,
+            cap.profile_cb_hidden_ask,
+            cap.profile_cb_tape_ask,
+            cap.profile_cb_qkv_ask,
+            cap.profile_cb_read,
+            cap.profile_cb_hidden_read,
+            cap.profile_cb_tape_read,
+            cap.profile_cb_qkv_read);
+    }
 
-    if (cap.profile_replay_wait_us || cap.profile_replay_gdn_enqueue_us || cap.profile_replay_gdn_wait_us ||
+    if (dflash_profile_has(cap.profile_flags, DFLASH_PROFILE_REPLAY) &&
+        (cap.profile_replay_wait_us || cap.profile_replay_gdn_enqueue_us || cap.profile_replay_gdn_wait_us ||
         cap.profile_replay_conv_enqueue_us || cap.profile_replay_conv_wait_us ||
         cap.profile_conv_gpu_us || cap.profile_conv_read_wait_us ||
         cap.profile_conv_cpu_us || cap.profile_conv_write_wait_us ||
         cap.profile_replay_layers || cap.profile_replay_sync_calls ||
-        cap.profile_replay_direct_gpu || cap.profile_replay_ggml_gpu || cap.profile_replay_cpu_fallback) {
+        cap.profile_replay_direct_gpu || cap.profile_replay_ggml_gpu || cap.profile_replay_cpu_fallback)) {
         LLAMA_LOG_INFO(
             "%s: dflash profile: replay_path=direct-gpu:%" PRIu64 " replay_path=ggml-gpu:%" PRIu64
             " replay_path=cpu-fallback:%" PRIu64 " replay_layers=%" PRIu64 " replay_sync_calls=%" PRIu64
@@ -1228,7 +1224,7 @@ static void dflash_profile_log(const dflash_capture_data & cap, const char * fun
             cap.profile_conv_cpu_us / 1000.0);
     }
 
-    if (!cap.profile_cb_names.empty()) {
+    if (dflash_profile_has(cap.profile_flags, DFLASH_PROFILE_TRACE) && !cap.profile_cb_names.empty()) {
         LLAMA_LOG_INFO("%s: dflash profile: callback tensors:\n", func);
         for (const auto & hit : cap.profile_cb_names) {
             LLAMA_LOG_INFO("%s: dflash profile:   %" PRIu64 " %s\n", func, hit.second, hit.first.c_str());
@@ -1486,7 +1482,8 @@ void llama_context::set_dflash_capture(const int32_t * layer_ids, int32_t n_laye
     if (!dflash_capture) {
         dflash_capture = std::make_unique<dflash_capture_data>();
         dflash_capture->hiddens = &layer_hiddens;
-        dflash_capture->profile = dflash_profile_enabled();
+        dflash_capture->profile_flags = dflash_profile_flags();
+        dflash_capture->profile = dflash_capture->profile_flags != 0;
     }
 
     dflash_capture->capture_active = true;
@@ -2149,8 +2146,10 @@ void llama_context::dflash_prefill_capture_begin(llama_seq_id seq_id, int32_t ca
         }
     }
 
-    LLAMA_LOG_INFO("%s: dflash prefill plan: slot=%d capture_begin=%d capture_end=%d n_tokens=%d\n",
-        __func__, (int) seq_id, (int) capture_begin, (int) capture_end, (int) plan.n_tokens);
+    if (dflash_profile_enabled(DFLASH_PROFILE_PREFILL)) {
+        LLAMA_LOG_INFO("%s: dflash prefill plan: slot=%d capture_begin=%d capture_end=%d n_tokens=%d\n",
+            __func__, (int) seq_id, (int) capture_begin, (int) capture_end, (int) plan.n_tokens);
+    }
 }
 
 void llama_context::dflash_prefill_capture_end() {
@@ -3346,7 +3345,7 @@ void llama_context::tape_replay_sync() {
                      dflash_capture->replay_n_accepted,
                      dflash_capture->replay_seq_id);
 
-    if (dflash_capture->profile) {
+    if (dflash_profile_has(dflash_capture->profile_flags, DFLASH_PROFILE_REPLAY)) {
         LLAMA_LOG_INFO(
             "%s: dflash profile: replay_path=direct-gpu:%" PRIu64 " replay_path=ggml-gpu:%" PRIu64
             " replay_path=cpu-fallback:%" PRIu64 " replay_layers=%" PRIu64 " replay_sync_calls=%" PRIu64
@@ -3444,7 +3443,7 @@ void llama_context::dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup
         return;
     }
 
-    const bool profile = dflash_capture && dflash_capture->profile;
+    const bool profile = dflash_capture && dflash_profile_has(dflash_capture->profile_flags, DFLASH_PROFILE_COPY);
     const int64_t t_start_us = profile ? ggml_time_us() : 0;
     int64_t t_phase_us = t_start_us;
     int64_t attn_us = 0;
@@ -5609,8 +5608,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     }
                 }
 
-                LLAMA_LOG_INFO("%s: dflash prefill capture complete: slot=%d planned=%d written=%d\n",
-                    __func__, (int) plan->seq_id, (int) plan->n_tokens, (int) plan->n_written);
+                if (dflash_profile_enabled(DFLASH_PROFILE_PREFILL)) {
+                    LLAMA_LOG_INFO("%s: dflash prefill capture complete: slot=%d planned=%d written=%d\n",
+                        __func__, (int) plan->seq_id, (int) plan->n_tokens, (int) plan->n_written);
+                }
             }
         }
 

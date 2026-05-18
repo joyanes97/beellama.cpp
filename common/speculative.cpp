@@ -9,6 +9,7 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 #include "suffix-tree.h"
+#include "../src/dflash-profile.h"
 #include "../src/llama-ext.h"
 
 #include <algorithm>
@@ -56,14 +57,6 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"recycle",       COMMON_SPECULATIVE_TYPE_RECYCLE},
     {"dflash",        COMMON_SPECULATIVE_TYPE_DFLASH}
 };
-
-static bool common_dflash_profile_enabled() {
-    static const bool enabled = [] {
-        const char * env = std::getenv("GGML_DFLASH_PROFILE");
-        return env && std::atoi(env) != 0;
-    }();
-    return enabled;
-}
 
 static bool common_dflash_debug_logs_enabled() {
     static const bool enabled = [] {
@@ -1584,7 +1577,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
     // GPU cross-attention ring (nullptr = CPU fallback)
     void * gpu_ring_handle = nullptr;
-    bool profile = common_dflash_profile_enabled();
+    uint32_t profile_flags = dflash_profile_flags();
     bool kv_cache_init_attempted = false;
     bool kv_cache_enabled = false;
 
@@ -1620,6 +1613,10 @@ struct common_speculative_state_dflash : public common_speculative_state {
     std::vector<int32_t> capture_layers;
     bool target_capture_enabled = true;
     bool gpu_capture_available = false;
+
+    bool profile_enabled(uint32_t flags) const {
+        return dflash_profile_has(profile_flags, flags);
+    }
 
     // build interleaved cross-attention data from ring buffer (GPU or CPU path)
     int build_cross_data(llama_context * ctx) {
@@ -1676,10 +1673,11 @@ struct common_speculative_state_dflash : public common_speculative_state {
         const int gpu_write_pos = ring_write_pos % cross_ctx;
         const int gpu_filled = std::min(ring_filled, cross_ctx);
 
-        const int64_t t_start = profile ? ggml_time_us() : 0;
+        const bool profile_copy = profile_enabled(DFLASH_PROFILE_COPY);
+        const int64_t t_start = profile_copy ? ggml_time_us() : 0;
         const bool ok = llama_dflash_kv_cache_update_from_ring(ctx_dft, gpu_ring_handle,
                 gpu_write_pos, gpu_filled, n_target_layers, n_embd, n_update);
-        if (profile) {
+        if (profile_copy) {
             LOG_INF("dflash profile: kv_cache_update requested=%d update=%d ok=%d time=%.3f ms ring_pos=%d filled=%d committed=%d\n",
                     n_written, n_update, ok ? 1 : 0, (ggml_time_us() - t_start) / 1e3,
                     gpu_write_pos, gpu_filled, committed_len);
@@ -1893,7 +1891,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
             // GPU buffers, and tape metadata were preserved across the
             // temporary disable, so no re-allocation is needed.
             llama_set_dflash_capture_active(ctx_tgt, true);
-            if (profile) {
+            if (profile_enabled(DFLASH_PROFILE_PREFILL)) {
                 LOG_INF("dflash prefill capture: enabled hidden capture gpu=%d layers=%d\n",
                         gpu_capture_available ? 1 : 0, (int) capture_layers.size());
             }
@@ -1901,7 +1899,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
             // Logically disable hidden capture without destroying GPU
             // buffers, tape metadata, or layer configuration.
             llama_set_dflash_capture_active(ctx_tgt, false);
-            if (profile) {
+            if (profile_enabled(DFLASH_PROFILE_PREFILL)) {
                 LOG_INF("dflash prefill capture: disabled hidden capture for non-suffix prompt chunk\n");
             }
         }
@@ -2017,7 +2015,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
             n_src_layers = llama_get_n_layer_hiddens(ctx_tgt);
             if (n_src_layers == 0) {
-                if (profile) {
+                if (profile_enabled(DFLASH_PROFILE_PREFILL)) {
                     LOG_INF("dflash prefill flush skipped: source=cpu reason=no-layer-slots n_src_layers=0\n");
                 }
                 return 0;
@@ -2027,7 +2025,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
             captured = llama_get_layer_hidden_n_tokens(ctx_tgt, 0);
 
             if (captured <= 0) {
-                if (profile) {
+                if (profile_enabled(DFLASH_PROFILE_PREFILL)) {
                     LOG_INF("dflash prefill flush skipped: source=cpu/verify_gpu reason=no-captured-tokens captured=0 n_tokens_arg=%d src_offset=%d\n",
                             n_tokens, src_offset);
                 }
@@ -2051,7 +2049,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         }
 
         if (captured <= 0) {
-            if (profile) {
+            if (profile_enabled(DFLASH_PROFILE_PREFILL)) {
                 LOG_INF("dflash prefill flush skipped: source=%s reason=no-captured-tokens captured=0 n_tokens_arg=%d src_offset=%d\n",
                     source == dflash_capture_source::prefill_gpu_hidden ? "prefill_gpu" : "cpu",
                     n_tokens, src_offset);
@@ -2069,7 +2067,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
             to_write = std::max(0, (int)captured - offset);
         }
         if (to_write <= 0) {
-            if (profile) {
+            if (profile_enabled(DFLASH_PROFILE_PREFILL)) {
                 LOG_INF("dflash prefill flush skipped: source=%s reason=empty-clamped-span captured=%lld offset=%d to_write=%d\n",
                     source == dflash_capture_source::prefill_gpu_hidden ? "prefill_gpu" : "cpu",
                     (long long)captured, offset, to_write);
@@ -2077,7 +2075,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
             return 0;
         }
 
-        if (profile) {
+        if (profile_enabled(DFLASH_PROFILE_PREFILL)) {
             const char * capture_source =
                 source == dflash_capture_source::prefill_gpu_hidden ? "prefill_gpu" :
                 source == dflash_capture_source::verify_gpu_hidden  ? "verify_gpu"  :
@@ -2332,7 +2330,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         n_draft_last = (int) result.size();
 
-        if (profile) {
+        if (profile_enabled(DFLASH_PROFILE_SUMMARY)) {
             const llama_perf_context_data perf_dft = llama_perf_context(ctx_dft);
             LOG_INF("dflash profile: draft ctx=%d cross_len=%d n_draft=%d produced=%d "
                     "cross=%.3f ms batch=%.3f ms decode=%.3f ms argmax=%.3f ms total=%.3f ms gpu_ring=%d graph_reuse=%d\n",
@@ -2617,7 +2615,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
 private:
     void log_ring_profile(const char * name, int n_tokens, int actual_written,
             int64_t cpu_copy_us, int64_t gpu_enqueue_us, int64_t gpu_sync_us) const {
-        if (!profile) {
+        if (!profile_enabled(DFLASH_PROFILE_COPY)) {
             return;
         }
         LOG_INF("dflash profile: %s requested=%d written=%d cpu_copy=%.3f ms gpu_enqueue=%.3f ms gpu_sync=%.3f ms ring_filled_before=%d committed_before=%d gpu=%d\n",
@@ -2711,14 +2709,15 @@ private:
             // ring or no GPU ring is available. In prefill GPU mode, we have no
             // CPU data, so the CPU ring is not kept in sync with this write.
             if (cpu_ring_should_track && data) {
-                const int64_t t_start = profile ? ggml_time_us() : 0;
+                const bool profile_copy = profile_enabled(DFLASH_PROFILE_COPY);
+                const int64_t t_start = profile_copy ? ggml_time_us() : 0;
                 for (int t = 0; t < actual_written; ++t) {
                     int slot = (ring_write_pos + t) % RING_SIZE;
                     memcpy(ring_buf[layer].data() + (size_t)slot * embd,
                            data + (size_t)(src_offset + t) * embd,
                            embd * sizeof(float));
                 }
-                if (profile) {
+                if (profile_copy) {
                     cpu_copy_us += ggml_time_us() - t_start;
                 }
             } else if (cpu_ring_should_track) {
@@ -2729,7 +2728,8 @@ private:
             if (gpu_ring_handle) {
                 const auto plan = common_dflash_ring_write_plan(cross_ctx, ring_write_pos, actual_written);
                 if (plan.n_tokens > 0) {
-                    const int64_t t_start = profile ? ggml_time_us() : 0;
+                    const bool profile_copy = profile_enabled(DFLASH_PROFILE_COPY);
+                    const int64_t t_start = profile_copy ? ggml_time_us() : 0;
                     bool used_d2d = false;
                     if (!data) {
                         // No CPU hidden data — try GPU buffer D2D paths.
@@ -2757,7 +2757,7 @@ private:
                             data + (size_t)(src_offset + plan.src_token_offset) * embd,
                             plan.n_tokens, embd);
                     }
-                    if (profile) {
+                    if (profile_copy) {
                         gpu_enqueue_us += ggml_time_us() - t_start;
                     }
                     gpu_upload_queued = true;
@@ -2772,9 +2772,10 @@ private:
         if (gpu_upload_queued) {
             // Hidden capture storage is reused on the next target decode; keep
             // async H2D uploads from reading freed or overwritten vectors.
-            const int64_t t_start = profile ? ggml_time_us() : 0;
+            const bool profile_copy = profile_enabled(DFLASH_PROFILE_COPY);
+            const int64_t t_start = profile_copy ? ggml_time_us() : 0;
             llama_dflash_cross_ring_gpu_synchronize(gpu_ring_handle);
-            if (profile) {
+            if (profile_copy) {
                 gpu_sync_us += ggml_time_us() - t_start;
             }
         }
@@ -2841,19 +2842,21 @@ private:
             for (int t = 0; t < actual_written; ++t) {
                 int src_idx = indices[t];
                 int ring_slot = (ring_write_pos + t) % RING_SIZE;
-                const int64_t t_cpu_start = profile ? ggml_time_us() : 0;
+                const bool profile_copy = profile_enabled(DFLASH_PROFILE_COPY);
+                const int64_t t_cpu_start = profile_copy ? ggml_time_us() : 0;
                 memcpy(ring_buf[layer].data() + (size_t)ring_slot * embd,
                        data + (size_t)src_idx * embd,
                        embd * sizeof(float));
-                if (profile) {
+                if (profile_copy) {
                     cpu_copy_us += ggml_time_us() - t_cpu_start;
                 }
                 if (gpu_ring_handle) {
                     int gpu_pos = (ring_write_pos + t) % cross_ctx;
-                    const int64_t t_gpu_start = profile ? ggml_time_us() : 0;
+                    const bool profile_copy = profile_enabled(DFLASH_PROFILE_COPY);
+                    const int64_t t_gpu_start = profile_copy ? ggml_time_us() : 0;
                     llama_dflash_cross_ring_gpu_write(gpu_ring_handle, layer, gpu_pos,
                         data + (size_t)src_idx * embd, 1, embd);
-                    if (profile) {
+                    if (profile_copy) {
                         gpu_enqueue_us += ggml_time_us() - t_gpu_start;
                     }
                     gpu_upload_queued = true;
@@ -2864,9 +2867,10 @@ private:
         if (gpu_upload_queued) {
             // Hidden capture storage is reused on the next target decode; keep
             // async H2D uploads from reading freed or overwritten vectors.
-            const int64_t t_start = profile ? ggml_time_us() : 0;
+            const bool profile_copy = profile_enabled(DFLASH_PROFILE_COPY);
+            const int64_t t_start = profile_copy ? ggml_time_us() : 0;
             llama_dflash_cross_ring_gpu_synchronize(gpu_ring_handle);
-            if (profile) {
+            if (profile_copy) {
                 gpu_sync_us += ggml_time_us() - t_start;
             }
         }

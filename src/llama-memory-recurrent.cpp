@@ -4,13 +4,13 @@
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-batch.h"
+#include "dflash-profile.h"
 #include "llama-model.h"
 
 #include "ggml-backend.h"
 
 #include <algorithm>
 #include <cassert>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -23,13 +23,6 @@ struct ggml_backend_buft_comparator {
     }
 };
 
-static bool dflash_recurrent_profile_enabled() {
-    static const bool enabled = []() {
-        const char * env = std::getenv("GGML_DFLASH_PROFILE");
-        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
 } // namespace
 
 //
@@ -550,7 +543,7 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
 
     llama_memory_recurrent_copy_profile profile;
     profile.layers_scanned = hparams.n_layer;
-    const bool profile_timing = dflash_recurrent_profile_enabled();
+    const bool profile_timing = dflash_profile_enabled(DFLASH_PROFILE_COPY);
 
     // CUDA's generic buffer copy path synchronizes every tensor copy. DFlash
     // backup/rollback copies both recurrent states across many layers, so cache

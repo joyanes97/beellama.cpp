@@ -12,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <map>
 #include <unordered_map>
 #include <vector>
@@ -202,7 +203,8 @@ struct dflash_capture_data {
     // Reused scratch for the multi-seq scatter path (avoid per-ubatch alloc).
     std::vector<float> scatter_buf;
 
-    // Opt-in DFlash profiling (GGML_DFLASH_PROFILE=1).
+    // Opt-in DFlash profiling (GGML_DFLASH_PROFILE=summary,replay,copy,prefill,verify,trace).
+    uint32_t profile_flags = 0;
     bool profile = false;
     bool multi_gpu_capture_fallback_logged = false;
     bool multi_gpu_replay_fallback_logged = false;
