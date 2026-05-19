@@ -51,6 +51,14 @@ int main(int argc, char ** argv) {
 
     ok &= expect(perplexity.find("static int ppl_max_logits_rows(int n_vocab, const common_params & params)") != std::string::npos,
         "perplexity must cap full-vocab logits rows to avoid multi-GiB output buffers");
+    ok &= expect(perplexity.find("PPL_LOGITS_MAGIC") != std::string::npos &&
+                 perplexity.find("'2'") != std::string::npos,
+        "perplexity logits cache format must use a versioned magic after streaming layout changes");
+    ok &= expect(perplexity.find("logits_stream.write(PPL_LOGITS_MAGIC, sizeof(PPL_LOGITS_MAGIC))") != std::string::npos &&
+                 perplexity.find("memcmp(PPL_LOGITS_MAGIC, check, sizeof(PPL_LOGITS_MAGIC))") != std::string::npos,
+        "perplexity logits writer/reader must use the same versioned magic");
+    ok &= expect(perplexity.find("unsupported log-probability file format") != std::string::npos,
+        "perplexity KL reader must reject incompatible logits cache files clearly");
     ok &= expect(kl.find("const int max_logits_rows = ppl_max_logits_rows(n_vocab, params)") != std::string::npos,
         "KL divergence must use the bounded logits-row cap");
     ok &= expect(kl.find("const int n_batch = std::max(1, std::min(n_ctx_i, std::min(params.n_batch, max_logits_rows)))") != std::string::npos,

@@ -37,6 +37,8 @@ struct results_log_softmax {
     float  prob;
 };
 
+static constexpr char PPL_LOGITS_MAGIC[8] = { '_', 'l', 'o', 'g', 'i', 't', 's', '2' };
+
 static std::vector<float> softmax(const std::vector<float>& logits) {
     std::vector<float> probs(logits.size());
     float max_logit = logits[0];
@@ -484,7 +486,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
             return {};
         }
         LOG_INF("%s: saving all logits to %s\n", __func__, params.logits_file.c_str());
-        logits_stream.write("_logits_", 8);
+        logits_stream.write(PPL_LOGITS_MAGIC, sizeof(PPL_LOGITS_MAGIC));
         logits_stream.write(reinterpret_cast<const char *>(&n_ctx), sizeof(n_ctx));
         if (!logits_stream.good()) {
             LOG_ERR("%s: failed writing logits header\n", __func__);
@@ -1760,10 +1762,10 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
         return;
     }
     {
-        char check[9]; check[8] = 0;
-        in.read(check, 8);
-        if (in.fail() || strncmp("_logits_", check, 8) != 0) {
-            LOG_ERR("%s: %s does not look like a file containing log-probabilities\n", __func__, params.logits_file.c_str());
+        char check[sizeof(PPL_LOGITS_MAGIC)];
+        in.read(check, sizeof(check));
+        if (in.fail() || memcmp(PPL_LOGITS_MAGIC, check, sizeof(PPL_LOGITS_MAGIC)) != 0) {
+            LOG_ERR("%s: %s uses an unsupported log-probability file format\n", __func__, params.logits_file.c_str());
             return;
         }
     }
