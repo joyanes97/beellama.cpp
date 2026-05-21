@@ -4961,7 +4961,7 @@ private:
             }
             const int64_t t_verify_elapsed = ggml_time_us() - t_verify_start;
             t_verify_total += t_verify_elapsed;
-            SRV_INF("  decode ubatch: %d tok, %.1fms (%.2fms/tok)\n",
+            SRV_DBG("  decode ubatch: %d tok, %.1fms (%.2fms/tok)\n",
                     n_tokens, t_verify_elapsed / 1e3, t_verify_elapsed / 1e3 / std::max(1, n_tokens));
 
             metrics.on_decoded(slots);
@@ -5880,7 +5880,7 @@ private:
                         recurrent_backup_layers, recurrent_backup_tensors, recurrent_backup_cuda_d2d,
                         recurrent_backup_fallback, t_tape_record_total / 1e3, t_cycle_total / 1e3);
             } else {
-                SRV_INF("spec cycle (%d slots): draft=%.1fms verify=%.1fms accept=%.1fms other=%.1fms total=%.1fms\n",
+                SRV_DBG("spec cycle (%d slots): draft=%.1fms verify=%.1fms accept=%.1fms other=%.1fms total=%.1fms\n",
                         n_slots_drafted,
                         t_draft_total / 1e3, t_verify_total / 1e3, t_accept_total / 1e3,
                         t_other / 1e3, t_cycle_total / 1e3);
