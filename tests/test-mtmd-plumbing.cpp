@@ -61,6 +61,8 @@ int main(int argc, char ** argv) {
 
     ok &= expect(clip_cpp.find("clip_set_limit_image_tokens_for_non_causal_decode(hparams, 252, 280, decoder_n_ubatch)") != std::string::npos,
         "Gemma4 image token limits must be capped to decoder ubatch for non-causal image decode");
+    ok &= expect(clip_cpp.find("clip_set_limit_image_tokens_for_non_causal_decode(hparams, 8, 256, decoder_n_ubatch)") != std::string::npos,
+        "Gemma3 image token limits must be capped to decoder ubatch for non-causal image decode");
     ok &= expect(clip_cpp.find("loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION, ctx_params.decoder_n_ubatch)") != std::string::npos,
         "clip initialization must pass decoder ubatch into vision hparam loading");
     ok &= expect(mtmd_cpp.find("/* decoder_n_ubatch */ ctx_params.decoder_n_ubatch") != std::string::npos,

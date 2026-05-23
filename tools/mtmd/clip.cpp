@@ -1402,6 +1402,7 @@ struct clip_model_loader {
                         hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
                         // test model (tinygemma3) has a different value, we optionally read it
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
+                        clip_set_limit_image_tokens_for_non_causal_decode(hparams, 8, 256, decoder_n_ubatch);
                     } break;
 
                 case PROJECTOR_TYPE_GEMMA4V:
