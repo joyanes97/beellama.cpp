@@ -86,6 +86,19 @@ bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     return res;
 }
 
+bool llama_kv_cache_iswa::seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) {
+    bool res = true;
+
+    res = res & kv_base->seq_rm_cell(seq_id, cell_idx);
+    res = res & kv_swa ->seq_rm_cell(seq_id, cell_idx);
+
+    return res;
+}
+
+int llama_kv_cache_iswa::cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) {
+    return kv_base->cells_at_pos(seq_id, pos, cell_indices, n_max);
+}
+
 void llama_kv_cache_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     kv_base->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     kv_swa ->seq_cp(seq_id_src, seq_id_dst, p0, p1);
@@ -107,12 +120,16 @@ void llama_kv_cache_iswa::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p
 }
 
 llama_pos llama_kv_cache_iswa::seq_pos_min(llama_seq_id seq_id) const {
-    // the base cache is a superset of the SWA cache, so we can just check the SWA cache
+    // the SWA cache defines the oldest position still available to every layer
     return kv_swa->seq_pos_min(seq_id);
 }
 
 llama_pos llama_kv_cache_iswa::seq_pos_max(llama_seq_id seq_id) const {
-    return kv_swa->seq_pos_max(seq_id);
+    // The accepted suffix must stay current even when some layers source their
+    // live sliding-window context outside of kv_swa (for example DFlash draft
+    // SWA layers reading the target cross window directly). In the normal ISWA
+    // path both caches advance together, so the max remains unchanged there.
+    return std::max(kv_base->seq_pos_max(seq_id), kv_swa->seq_pos_max(seq_id));
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdown() const {

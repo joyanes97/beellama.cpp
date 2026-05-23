@@ -66,6 +66,13 @@ static bool dflash_verify_padding_enabled() {
     return enabled;
 }
 
+static bool server_model_is_dflash_drafter(const llama_model * model) {
+    return model &&
+        llama_model_dflash_block_size(model) > 1 &&
+        llama_model_dflash_n_target_layers(model) > 0 &&
+        llama_model_dflash_n_target_features(model) > 0;
+}
+
 static bool server_tail_pos_is_in_code_fence(
         const std::string & text,
         size_t              pos) {
@@ -1991,7 +1998,7 @@ private:
 
             auto params_dft = params_base;
 
-            params_dft.n_parallel   = 1;
+            params_dft.n_parallel   = params_base.n_parallel;
             params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx_tgt) : params_spec.n_ctx;
             params_dft.n_batch      = params_dft.n_ctx;
             params_dft.devices      = params_spec.devices;
@@ -2015,8 +2022,9 @@ private:
                 return false;
             }
 
-            // Auto-detect DFlash from drafter model architecture
-            if (llama_model_dflash_block_size(model_dft.get()) > 0 &&
+            // Auto-detect DFlash from complete drafter metadata.
+            const bool draft_is_dflash = server_model_is_dflash_drafter(model_dft.get());
+            if (draft_is_dflash &&
                 params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
                 params_base.speculative.set_type(COMMON_SPECULATIVE_TYPE_DFLASH);
                 SRV_INF("auto-detected DFlash drafter (block_size=%d)\n",
@@ -2024,6 +2032,11 @@ private:
             }
 
             if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                if (!draft_is_dflash) {
+                    SRV_ERR("draft model '%s' is not a valid DFlash drafter: missing complete DFlash metadata\n",
+                            params_dft.model.path.c_str());
+                    return false;
+                }
                 const int block_size = llama_model_dflash_block_size(model_dft.get());
                 params_dft.n_ubatch = LLAMA_DFLASH_MAX_SLOTS * block_size;
                 params_dft.n_parallel = std::max(1,
@@ -2044,6 +2057,17 @@ private:
                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
                 cparams.n_rs_seq = 0;
                 ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
+                ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+                params_base.speculative.draft.ctx_tgt = ctx_tgt;
+                params_base.speculative.draft.ctx_dft = ctx_dft.get();
+            } else if (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
+                auto cparams = common_context_params_to_llama(params_dft);
+                ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
+                if (ctx_dft == nullptr) {
+                    SRV_ERR("failed to create draft context, '%s'\n", params_dft.model.path.c_str());
+                    return false;
+                }
+
                 ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
                 params_base.speculative.draft.ctx_tgt = ctx_tgt;
                 params_base.speculative.draft.ctx_dft = ctx_dft.get();
@@ -2240,7 +2264,12 @@ private:
                 (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH || i < dflash_slots_cap);
 
             if (slot_can_spec) {
-                slot.spec.reset(common_speculative_init(params_base.speculative, slot.ctx_tgt, ctx_dft_shared.get()));
+                try {
+                    slot.spec.reset(common_speculative_init(params_base.speculative, slot.ctx_tgt, ctx_dft_shared.get()));
+                } catch (const std::exception & e) {
+                    SRV_ERR("failed to initialize slot speculative decoding context: %s\n", e.what());
+                    return false;
+                }
                 if (!slot.spec && spec) {
                     slot.spec_shared = spec.get();
                 }

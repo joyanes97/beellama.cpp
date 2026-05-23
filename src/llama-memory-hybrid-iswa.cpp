@@ -71,7 +71,10 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
         while (true) {
             llama_ubatch ubatch;
 
-            if (embd_all) {
+            // DFlash target models need per-seq ubatches so the per-ubatch slot
+            // switch in llama_context::decode() can route hidden-state capture
+            // and tape writes to the correct slot.
+            if (embd_all || force_split_seq) {
                 // if all tokens are output, split by sequence
                 ubatch = balloc.split_seq(n_ubatch);
             } else {
@@ -152,9 +155,29 @@ bool llama_memory_hybrid_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_p
     return mem_attn->seq_rm(seq_id, p0, p1);
 }
 
+bool llama_memory_hybrid_iswa::seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) {
+    return mem_attn->seq_rm_cell(seq_id, cell_idx);
+}
+
+int llama_memory_hybrid_iswa::cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) {
+    return mem_attn->cells_at_pos(seq_id, pos, cell_indices, n_max);
+}
+
 void llama_memory_hybrid_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
+void llama_memory_hybrid_iswa::seq_cp_recurrent(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
+void llama_memory_hybrid_iswa::recurrent_copy_profile_reset() {
+    mem_recr->recurrent_copy_profile_reset();
+}
+
+llama_memory_recurrent_copy_profile llama_memory_hybrid_iswa::recurrent_copy_profile() const {
+    return mem_recr->recurrent_copy_profile();
 }
 
 void llama_memory_hybrid_iswa::seq_keep(llama_seq_id seq_id) {

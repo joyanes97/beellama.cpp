@@ -41,7 +41,7 @@ configure_file(${TEMPLATE_FILE} ${OUTPUT_FILE})
 set(TARGET llama-common-base)
 add_library(${TARGET} STATIC ${OUTPUT_FILE})
 
-target_include_directories(${TARGET} PUBLIC .)
+target_include_directories(${TARGET} PUBLIC . ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/include)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -102,6 +102,9 @@ add_library(${TARGET}
     sampling.h
     speculative.cpp
     speculative.h
+    suffix-tree.cpp
+    suffix-tree.h
+    int32-map.h
     unicode.cpp
     unicode.h
     jinja/lexer.cpp

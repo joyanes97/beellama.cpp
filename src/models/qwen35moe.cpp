@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-context.h"
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
@@ -179,6 +180,12 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
 
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
+    const int64_t n_seqs       = ubatch.n_seqs;
+    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+    const int64_t dflash_capture_n_seqs =
+        ubatch.n_seqs_unq > 1 ? (int64_t) ubatch.n_seqs_unq : 1;
+    const int64_t dflash_capture_n_tokens =
+        ubatch.n_seqs_unq > 1 ? n_seq_tokens : (int64_t) ubatch.n_tokens;
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     const int n_transformer_layers = n_layer - (int) hparams.nextn_predict_layers;
@@ -226,6 +233,79 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
+        if (cparams.hidden_gpu_n_seqs > 0 &&
+            cur->ne[1] == dflash_capture_n_tokens * dflash_capture_n_seqs) {
+            for (int s = 0; s < (int) dflash_capture_n_seqs && s < cparams.hidden_gpu_n_seqs; ++s) {
+                auto * hgpu = cparams.hidden_gpu_seqs[s];
+                if (!hgpu) {
+                    continue;
+                }
+
+                int hi = -1;
+                for (int i = 0; i < (int) hgpu->layer_ids.size(); ++i) {
+                    if (hgpu->layer_ids[i] == il) {
+                        hi = i;
+                        break;
+                    }
+                }
+                if (hi < 0 || dflash_capture_n_tokens > hgpu->max_tokens) {
+                    continue;
+                }
+
+                ggml_tensor * h_slice = ggml_view_2d(ctx0, cur,
+                    cur->ne[0], dflash_capture_n_tokens,
+                    cur->nb[1],
+                    (size_t) s * (size_t) dflash_capture_n_tokens * cur->nb[1]);
+                ggml_tensor * h_cont = ggml_cont(ctx0, h_slice);
+                ggml_tensor * h_dst = ggml_view_2d(ctx0, hgpu->layers[hi],
+                    hgpu->layers[hi]->ne[0], (int64_t) dflash_capture_n_tokens,
+                    hgpu->layers[hi]->nb[1], 0);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, h_cont, h_dst));
+            }
+        }
+
+        if (cparams.prefill_gpu_n_seqs > 0 &&
+            cparams.dflash_prefill_capture_active &&
+            cparams.dflash_prefill_n_tokens > 0 &&
+            cur->ne[1] == dflash_capture_n_tokens * dflash_capture_n_seqs) {
+            for (int s = 0; s < (int) dflash_capture_n_seqs && s < cparams.prefill_gpu_n_seqs; ++s) {
+                const int n_copy  = cparams.dflash_prefill_n_tokens_seqs[s];
+                const int src_off = cparams.dflash_prefill_src_offsets[s];
+                const int dst_off = cparams.dflash_prefill_dst_offsets[s];
+                if (n_copy <= 0 || src_off < 0 || src_off + n_copy > dflash_capture_n_tokens) {
+                    continue;
+                }
+
+                auto * pgpu = cparams.prefill_gpu_seqs[s];
+                if (!pgpu) {
+                    continue;
+                }
+
+                int hi = -1;
+                for (int i = 0; i < (int) pgpu->layer_ids.size(); ++i) {
+                    if (pgpu->layer_ids[i] == il) {
+                        hi = i;
+                        break;
+                    }
+                }
+                if (hi < 0 || dst_off < 0 || dst_off + n_copy > pgpu->max_tokens) {
+                    continue;
+                }
+
+                ggml_tensor * h_slice = ggml_view_2d(ctx0, cur,
+                    cur->ne[0], (int64_t) n_copy,
+                    cur->nb[1],
+                    (size_t) s * (size_t) dflash_capture_n_tokens * cur->nb[1] +
+                    (size_t) src_off * cur->nb[1]);
+                ggml_tensor * h_cont = ggml_cont(ctx0, h_slice);
+                ggml_tensor * h_dst = ggml_view_2d(ctx0, pgpu->layers[hi],
+                    pgpu->layers[hi]->ne[0], (int64_t) n_copy,
+                    pgpu->layers[hi]->nb[1],
+                    (size_t) dst_off * pgpu->layers[hi]->nb[1]);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, h_cont, h_dst));
+            }
+        }
+
         // Input for next layer
         inpL = cur;
     }
@@ -250,7 +330,22 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
-    ggml_build_forward_expand(gf, cur);
+    const bool dflash_compact_verifier_only =
+        cparams.dflash_reduced_consumer_active && cparams.dflash_verify_logits;
+
+    if (cparams.dflash_verify_logits) {
+        const int topk = std::max(1, std::min(cparams.dflash_verify_topk, 64));
+        if (topk > 1) {
+            res->t_logits_argmax = ggml_topk_ext(ctx0, cur, topk, 0.0f, 0);
+        } else {
+            res->t_logits_argmax = ggml_argmax_ext(ctx0, cur, 0.0f, 0);
+        }
+        ggml_build_forward_expand(gf, res->t_logits_argmax);
+    }
+
+    if (!dflash_compact_verifier_only) {
+        ggml_build_forward_expand(gf, cur);
+    }
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35moe::graph::build_qkvz(
@@ -388,6 +483,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
+    ggml_tensor * beta_presigmoid = beta;
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
@@ -411,7 +507,12 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     const int64_t conv_kernel_size = conv_kernel->ne[0];
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
-    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+    ggml_tensor * qkv_mixed_pretranspose = qkv_mixed;
+    cb(qkv_mixed_pretranspose, "qkv_mixed_pretranspose", il);
+    qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
+    cb(qkv_mixed, "qkv_mixed_transposed", il);
+
+    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il, true);
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
@@ -472,6 +573,65 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     cb(q_conv, "q_conv_predelta", il);
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
+
+    if (cparams.tape_gpu_n_seqs > 0) {
+        for (int s = 0; s < (int)n_seqs && s < cparams.tape_gpu_n_seqs; ++s) {
+            auto * tgpu = cparams.tape_gpu_seqs[s];
+            if (!tgpu) continue;
+
+            int li = -1;
+            for (int i = 0; i < (int)tgpu->layer_ids.size(); ++i) {
+                if (tgpu->layer_ids[i] == il) { li = i; break; }
+            }
+            if (li < 0 || n_seq_tokens > tgpu->max_tokens) continue;
+
+            auto & tl = tgpu->layers[li];
+
+            ggml_tensor * k_slice = ggml_view_3d(ctx0, k_conv,
+                k_conv->ne[0], k_conv->ne[1], n_seq_tokens,
+                k_conv->nb[1], k_conv->nb[2], s * k_conv->nb[3]);
+            ggml_tensor * v_slice = ggml_view_3d(ctx0, v_conv,
+                v_conv->ne[0], v_conv->ne[1], n_seq_tokens,
+                v_conv->nb[1], v_conv->nb[2], s * v_conv->nb[3]);
+            ggml_tensor * g_slice = ggml_view_3d(ctx0, gate,
+                gate->ne[0], gate->ne[1], n_seq_tokens,
+                gate->nb[1], gate->nb[2], s * gate->nb[3]);
+            ggml_tensor * b_slice = ggml_view_3d(ctx0, beta_presigmoid,
+                beta_presigmoid->ne[0], beta_presigmoid->ne[1], n_seq_tokens,
+                beta_presigmoid->nb[1], beta_presigmoid->nb[2], s * beta_presigmoid->nb[3]);
+            ggml_tensor * qkv_slice = ggml_view_2d(ctx0, qkv_mixed_pretranspose,
+                qkv_mixed_pretranspose->ne[0], n_seq_tokens,
+                qkv_mixed_pretranspose->nb[1], s * qkv_mixed_pretranspose->nb[2]);
+
+            ggml_tensor * k_cont = ggml_cont(ctx0, k_slice);
+            ggml_tensor * v_cont = ggml_cont(ctx0, v_slice);
+            ggml_tensor * g_cont = ggml_cont(ctx0, g_slice);
+            ggml_tensor * b_cont = ggml_cont(ctx0, b_slice);
+            ggml_tensor * qkv_cont = ggml_cont(ctx0, qkv_slice);
+
+            ggml_tensor * k_dst = ggml_view_3d(ctx0, tl.k,
+                tl.k->ne[0], tl.k->ne[1], (int64_t)n_seq_tokens,
+                tl.k->nb[1], tl.k->nb[2], 0);
+            ggml_tensor * v_dst = ggml_view_3d(ctx0, tl.v,
+                tl.v->ne[0], tl.v->ne[1], (int64_t)n_seq_tokens,
+                tl.v->nb[1], tl.v->nb[2], 0);
+            ggml_tensor * g_dst = ggml_view_3d(ctx0, tl.gate,
+                tl.gate->ne[0], tl.gate->ne[1], (int64_t)n_seq_tokens,
+                tl.gate->nb[1], tl.gate->nb[2], 0);
+            ggml_tensor * b_dst = ggml_view_3d(ctx0, tl.beta,
+                tl.beta->ne[0], tl.beta->ne[1], (int64_t)n_seq_tokens,
+                tl.beta->nb[1], tl.beta->nb[2], 0);
+            ggml_tensor * qkv_dst = ggml_view_2d(ctx0, tl.qkv,
+                tl.qkv->ne[0], (int64_t)n_seq_tokens,
+                tl.qkv->nb[1], 0);
+
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, k_cont, k_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, v_cont, v_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, g_cont, g_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, b_cont, b_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, qkv_cont, qkv_dst));
+        }
+    }
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 
@@ -602,7 +762,7 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);
     cb(concat, "mtp_concat", il);
 
-    ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, concat);
+    ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
     cb(cur, "mtp_eh_proj", il);
 
     ggml_tensor * inpSA = cur;
@@ -722,8 +882,9 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cb(cur, "mtp_shared_head_norm", -1);
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur);
+    cur = build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

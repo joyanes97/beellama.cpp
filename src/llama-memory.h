@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-graph.h"
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <functional>
@@ -39,6 +40,15 @@ llama_memory_status llama_memory_status_combine(llama_memory_status s0, llama_me
 // helper function for checking if a memory status indicates a failure
 bool llama_memory_status_is_fail(llama_memory_status status);
 
+struct llama_memory_recurrent_copy_profile {
+    uint64_t layers_scanned = 0;
+    uint64_t tensors_copied = 0;
+    uint64_t cuda_d2d_queued = 0;
+    uint64_t fallback_copies = 0;
+    uint64_t enqueue_us = 0;
+    uint64_t sync_us = 0;
+};
+
 // the interface for managing the memory context during batch processing
 // this interface is implemented per memory type. see:
 //   - llama_kv_cache_context
@@ -62,6 +72,11 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // TurboQuant: get rotation tensors for pre-rotate-queries optimization
+    // Returns null for non-turbo memory types. Override in KV cache contexts.
+    virtual ggml_tensor * get_turbo_rot_forward() const { return nullptr; }
+    virtual ggml_tensor * get_turbo_rot_inverse() const { return nullptr; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
@@ -104,7 +119,21 @@ struct llama_memory_i {
     virtual void clear(bool data) = 0;
 
     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
+    virtual bool seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) = 0;
+
+    // Return the number of KV cells at a given position for a seq_id.
+    // If cell_indices is not NULL and n_max > 0, fill cell_indices with up to n_max cell indices.
+    // Returns the total number of cells at the position (may exceed n_max).
+    virtual int cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) = 0;
+
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
+
+    // Copy only recurrent state (skip KV/attention). Used by DFlash flat-mode backup
+    // where KV backup is unnecessary — flat mode rollback trims rejected positions
+    // without needing a full KV restore.
+    virtual void seq_cp_recurrent(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
+    virtual void recurrent_copy_profile_reset() {}
+    virtual llama_memory_recurrent_copy_profile recurrent_copy_profile() const { return {}; }
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
@@ -120,6 +149,10 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    // DFlash: force per-seq ubatch splits so each ubatch carries exactly one slot's tokens.
+    // Default no-op; hybrid memories override.
+    virtual void set_force_split_seq(bool /*v*/) {}
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

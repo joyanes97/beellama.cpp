@@ -320,9 +320,9 @@ static int common_download_file_single_online(const std::string & url,
 
     auto head = cli.Head(parts.path);
     if (!head || head->status < 200 || head->status >= 300) {
-        LOG_TRC("%s: HEAD failed, status: %d\n", __func__, head ? head->status : -1);
+        LOG_WRN("%s: HEAD failed, status: %d\n", __func__, head ? head->status : -1);
         if (file_exists) {
-            LOG_TRC("%s: using cached file (HEAD failed): %s\n", __func__, path.c_str());
+            LOG_INF("%s: using cached file (HEAD failed): %s\n", __func__, path.c_str());
             return 304; // 304 Not Modified - fake cached response
         }
         return head ? head->status : -1;
@@ -566,11 +566,8 @@ static hf_cache::hf_files get_split_files(const hf_cache::hf_files & files,
     return result;
 }
 
-// pick the best sibling GGUF whose filename contains `keyword` (e.g. "mmproj" / "mtp"),
-// preferring deeper shared directory prefix with the model, then closest quantization
-static hf_cache::hf_file find_best_sibling(const hf_cache::hf_files & files,
-                                           const std::string        & model,
-                                           const std::string        & keyword) {
+static hf_cache::hf_file find_best_mmproj(const hf_cache::hf_files & files,
+                                          const std::string        & model) {
     hf_cache::hf_file best;
     size_t best_depth = 0;
     int best_diff = 0;
@@ -582,20 +579,20 @@ static hf_cache::hf_file find_best_sibling(const hf_cache::hf_files & files,
 
     for (const auto & f : files) {
         if (!string_ends_with(f.path, ".gguf") ||
-            f.path.find(keyword) == std::string::npos) {
+            f.path.find("mmproj") == std::string::npos) {
             continue;
         }
 
-        auto sib_parts = string_split<std::string>(f.path, '/');
-        auto sib_dir = sib_parts.end() - 1;
+        auto mmproj_parts = string_split<std::string>(f.path, '/');
+        auto mmproj_dir = mmproj_parts.end() - 1;
 
         auto [_, dir] = std::mismatch(model_parts.begin(), model_dir,
-                                      sib_parts.begin(), sib_dir);
-        if (dir != sib_dir) {
+                                      mmproj_parts.begin(), mmproj_dir);
+        if (dir != mmproj_dir) {
             continue;
         }
 
-        size_t depth = dir - sib_parts.begin();
+        size_t depth = dir - mmproj_parts.begin();
         auto bits = extract_quant_bits(f.path);
         auto diff = std::abs(bits - model_bits);
 
@@ -609,14 +606,92 @@ static hf_cache::hf_file find_best_sibling(const hf_cache::hf_files & files,
     return best;
 }
 
-static hf_cache::hf_file find_best_mmproj(const hf_cache::hf_files & files,
+static hf_cache::hf_file find_best_dflash(const hf_cache::hf_files & files,
                                           const std::string        & model) {
-    return find_best_sibling(files, model, "mmproj");
+    hf_cache::hf_file best;
+    int best_diff = 0;
+    bool found = false;
+
+    auto model_bits = extract_quant_bits(model);
+    auto model_parts = string_split<std::string>(model, '/');
+    auto model_dir = model_parts.end() - 1;
+
+    for (const auto & f : files) {
+        if (!string_ends_with(f.path, ".gguf")) {
+            continue;
+        }
+
+        std::string filename = f.path;
+        if (auto pos = filename.rfind('/'); pos != std::string::npos) {
+            filename = filename.substr(pos + 1);
+        }
+        if (filename.rfind("dflash-", 0) != 0 &&
+            filename.rfind("draft-dflash-", 0) != 0) {
+            continue;
+        }
+
+        auto dflash_parts = string_split<std::string>(f.path, '/');
+        auto dflash_dir = dflash_parts.end() - 1;
+
+        auto [model_common, dflash_common] = std::mismatch(model_parts.begin(), model_dir,
+                                                           dflash_parts.begin(), dflash_dir);
+        if (model_common != model_dir || dflash_common != dflash_dir) {
+            continue;
+        }
+
+        auto bits = extract_quant_bits(f.path);
+        auto diff = std::abs(bits - model_bits);
+
+        if (!found || diff < best_diff) {
+            best = f;
+            best_diff = diff;
+            found = true;
+        }
+    }
+
+    return best;
 }
 
 static hf_cache::hf_file find_best_mtp(const hf_cache::hf_files & files,
                                        const std::string        & model) {
-    return find_best_sibling(files, model, "mtp-");
+    hf_cache::hf_file best;
+    size_t best_depth = 0;
+    int best_diff = 0;
+
+    const auto model_parts = string_split<std::string>(model, '/');
+    if (model_parts.empty()) {
+        return best;
+    }
+    const auto model_dir = model_parts.end() - 1;
+
+    for (const auto & f : files) {
+        auto filename = f.path;
+        if (auto pos = filename.rfind('/'); pos != std::string::npos) {
+            filename = filename.substr(pos + 1);
+        }
+        if (filename.find("mtp-") == std::string::npos) {
+            continue;
+        }
+
+        auto sibling_parts = string_split<std::string>(f.path, '/');
+        auto sibling_dir = sibling_parts.end() - 1;
+        auto [model_common, sibling_common] = std::mismatch(model_parts.begin(), model_dir,
+                                                            sibling_parts.begin(), sibling_dir);
+        if (model_common != model_dir || sibling_common != sibling_dir) {
+            continue;
+        }
+
+        const size_t depth = std::distance(model_parts.begin(), model_common);
+        const int diff = std::abs(extract_quant_bits(f.path) - extract_quant_bits(model));
+
+        if (best.path.empty() || depth > best_depth || (depth == best_depth && diff < best_diff)) {
+            best = f;
+            best_depth = depth;
+            best_diff = diff;
+        }
+    }
+
+    return best;
 }
 
 static bool gguf_filename_is_model(const std::string & filepath) {
@@ -631,7 +706,9 @@ static bool gguf_filename_is_model(const std::string & filepath) {
 
     return filename.find("mmproj")  == std::string::npos &&
            filename.find("imatrix") == std::string::npos &&
-           filename.find("mtp-")    == std::string::npos;
+           filename.find("mtp-")    == std::string::npos &&
+           filename.rfind("dflash-", 0) != 0 &&
+           filename.rfind("draft-dflash-", 0) != 0;
 }
 
 static hf_cache::hf_file find_best_model(const hf_cache::hf_files & files,
@@ -688,12 +765,14 @@ struct hf_plan {
     hf_cache::hf_files model_files;
     hf_cache::hf_file mmproj;
     hf_cache::hf_file mtp;
+    hf_cache::hf_file dflash;
 };
 
 static hf_plan get_hf_plan(const common_params_model  & model,
                            const common_download_opts & opts,
                            bool download_mmproj,
-                           bool download_mtp) {
+                           bool download_mtp,
+                           bool download_dflash) {
     hf_plan plan;
     hf_cache::hf_files all;
 
@@ -738,9 +817,11 @@ static hf_plan get_hf_plan(const common_params_model  & model,
     if (download_mmproj) {
         plan.mmproj = find_best_mmproj(all, primary.path);
     }
-
     if (download_mtp) {
         plan.mtp = find_best_mtp(all, primary.path);
+    }
+    if (download_dflash) {
+        plan.dflash = find_best_dflash(all, primary.path);
     }
 
     return plan;
@@ -777,7 +858,8 @@ static std::vector<download_task> get_url_tasks(const common_params_model & mode
 common_download_model_result common_download_model(const common_params_model  & model,
                                                    const common_download_opts & opts,
                                                    bool download_mmproj,
-                                                   bool download_mtp) {
+                                                   bool download_mtp,
+                                                   bool download_dflash) {
     common_download_model_result result;
     std::vector<download_task> tasks;
     hf_plan hf;
@@ -785,7 +867,7 @@ common_download_model_result common_download_model(const common_params_model  & 
     bool is_hf = !model.hf_repo.empty();
 
     if (is_hf) {
-        hf = get_hf_plan(model, opts, download_mmproj, download_mtp);
+        hf = get_hf_plan(model, opts, download_mmproj, download_mtp, download_dflash);
         for (const auto & f : hf.model_files) {
             tasks.push_back({f.url, f.local_path});
         }
@@ -794,6 +876,9 @@ common_download_model_result common_download_model(const common_params_model  & 
         }
         if (!hf.mtp.path.empty()) {
             tasks.push_back({hf.mtp.url, hf.mtp.local_path});
+        }
+        if (!hf.dflash.path.empty()) {
+            tasks.push_back({hf.dflash.url, hf.dflash.local_path});
         }
     } else if (!model.url.empty()) {
         tasks = get_url_tasks(model);
@@ -831,9 +916,11 @@ common_download_model_result common_download_model(const common_params_model  & 
         if (!hf.mmproj.path.empty()) {
             result.mmproj_path = hf_cache::finalize_file(hf.mmproj);
         }
-
         if (!hf.mtp.path.empty()) {
             result.mtp_path = hf_cache::finalize_file(hf.mtp);
+        }
+        if (!hf.dflash.path.empty()) {
+            result.dflash_draft_path = hf_cache::finalize_file(hf.dflash);
         }
     } else {
         result.model_path = model.path;
@@ -974,8 +1061,7 @@ std::vector<common_cached_model_info> common_list_cached_models() {
     for (const auto & f : files) {
         auto split = get_gguf_split_info(f.path);
         if (split.index != 1 || split.tag.empty() ||
-            split.prefix.find("mmproj") != std::string::npos ||
-            split.prefix.find("mtp-")   != std::string::npos) {
+            split.prefix.find("mmproj") != std::string::npos) {
             continue;
         }
         if (seen.insert(f.repo_id + ":" + split.tag).second) {

@@ -284,6 +284,9 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_kimi_linear(params);
         case LLM_ARCH_STEP35:
             return new llama_model_step35(params);
+        case LLM_ARCH_DFLASH:
+        case LLM_ARCH_DFLASH_DRAFT:
+            return new llama_model_dflash_draft(params);
         default:
             throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
@@ -1334,6 +1337,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (!layer.ssm_beta_s && layer.ssm_beta) {
                 layer.ssm_beta_s = create_tensor(tn(LLM_TENSOR_SSM_BETA, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
+            if (!layer.nextn.eh_proj_s && layer.nextn.eh_proj) {
+                layer.nextn.eh_proj_s = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.nextn.shared_head_head_s && layer.nextn.shared_head_head) {
+                layer.nextn.shared_head_head_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+            }
 
             // input scales
             if (!layer.wq_in_s && layer.wq) {
@@ -1392,6 +1401,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (!layer.ssm_beta_in_s && layer.ssm_beta) {
                 layer.ssm_beta_in_s = create_tensor(tn(LLM_TENSOR_SSM_BETA, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.nextn.eh_proj_in_s && layer.nextn.eh_proj) {
+                layer.nextn.eh_proj_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.nextn.shared_head_head_in_s && layer.nextn.shared_head_head) {
+                layer.nextn.shared_head_head_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
         }
         // output scales
@@ -1937,9 +1952,26 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_MODERN_BERT:
         case LLM_ARCH_GEMMA_EMBEDDING:
         case LLM_ARCH_DREAM:
+            {
+                res = new llama_kv_cache(
+                        *this,
+                        params.type_k,
+                        params.type_v,
+                        !cparams.flash_attn,
+                        cparams.offload_kqv,
+                        cparams.kv_unified,
+                        cparams.n_ctx_seq,
+                        cparams.n_seq_max,
+                        1,
+                        hparams.n_swa,
+                        hparams.swa_type,
+                        nullptr,
+                        nullptr);
+            } break;
         case LLM_ARCH_LLADA:
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_RND1:
+        case LLM_ARCH_DFLASH:
             {
                 res = nullptr;
             } break;
@@ -2182,6 +2214,18 @@ int32_t llama_model_n_swa(const llama_model * model) {
     return model->hparams.n_swa;
 }
 
+const char * llama_model_arch_name(const llama_model * model) {
+    return model ? llm_arch_name(model->arch) : "unknown";
+}
+
+int32_t llama_model_is_swa_layer(const llama_model * model, int32_t il) {
+    if (!model || il < 0 || il >= (int32_t) model->hparams.n_layer) {
+        return -1;
+    }
+
+    return model->hparams.is_swa((uint32_t) il) ? 1 : 0;
+}
+
 
 uint32_t llama_model_n_cls_out(const struct llama_model * model) {
     return model->hparams.n_cls_out;
@@ -2341,6 +2385,8 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_STEP35:
+        case LLM_ARCH_DFLASH:
+        case LLM_ARCH_DFLASH_DRAFT:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:
@@ -2370,6 +2416,63 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
 
 float llama_model_rope_freq_scale_train(const llama_model * model) {
     return model->hparams.rope_freq_scale_train;
+}
+
+float llama_model_rope_freq_base_train(const llama_model * model) {
+    return model->hparams.rope_freq_base_train;
+}
+
+float llama_model_rope_freq_base_train_swa(const llama_model * model) {
+    return model->hparams.rope_freq_base_train_swa;
+}
+
+float llama_model_rope_freq_scale_train_swa(const llama_model * model) {
+    return model->hparams.rope_freq_scale_train_swa;
+}
+
+void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
+    dst->tok_embd = src->tok_embd;
+    dst->output   = src->output;
+}
+
+int32_t llama_model_dflash_block_size(const llama_model * model) {
+    if (!model || !llm_arch_is_dflash_drafter(model->arch)) {
+        return 0;
+    }
+    return (int32_t) model->hparams.dflash_block_size;
+}
+
+int32_t llama_model_dflash_mask_token_id(const llama_model * model) {
+    if (!model || !llm_arch_is_dflash_drafter(model->arch)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    return (int32_t) model->hparams.dflash_mask_token_id;
+}
+
+int32_t llama_model_dflash_n_target_layers(const llama_model * model) {
+    if (!model || !llm_arch_is_dflash_drafter(model->arch)) {
+        return 0;
+    }
+    return (int32_t) model->hparams.dflash_n_target_layers;
+}
+
+int32_t llama_model_dflash_n_target_features(const llama_model * model) {
+    if (!model || !llm_arch_is_dflash_drafter(model->arch)) {
+        return 0;
+    }
+    return (int32_t) model->hparams.dflash_n_target_features;
+}
+
+int32_t llama_model_dflash_target_layer_ids(const llama_model * model, int32_t * layer_ids, int32_t capacity) {
+    if (!model || !llm_arch_is_dflash_drafter(model->arch)) {
+        return 0;
+    }
+    int32_t n = (int32_t) model->hparams.dflash_n_target_layers;
+    if (n > capacity) n = capacity;
+    for (int32_t i = 0; i < n; ++i) {
+        layer_ids[i] = (int32_t) model->hparams.dflash_target_layer_ids[i];
+    }
+    return n;
 }
 
 int32_t llama_model_meta_val_str(const llama_model * model, const char * key, char * buf, size_t buf_size) {

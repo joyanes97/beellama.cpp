@@ -202,12 +202,16 @@ struct llama_layer_shortconv {
 };
 
 struct llama_layer_nextn {
-    struct ggml_tensor * eh_proj          = nullptr;
-    struct ggml_tensor * embed_tokens     = nullptr;
-    struct ggml_tensor * enorm            = nullptr;
-    struct ggml_tensor * hnorm            = nullptr;
-    struct ggml_tensor * shared_head_head = nullptr;
-    struct ggml_tensor * shared_head_norm = nullptr;
+    struct ggml_tensor * eh_proj               = nullptr;
+    struct ggml_tensor * eh_proj_s             = nullptr;
+    struct ggml_tensor * eh_proj_in_s          = nullptr;
+    struct ggml_tensor * embed_tokens          = nullptr;
+    struct ggml_tensor * enorm                 = nullptr;
+    struct ggml_tensor * hnorm                 = nullptr;
+    struct ggml_tensor * shared_head_head      = nullptr;
+    struct ggml_tensor * shared_head_head_s    = nullptr;
+    struct ggml_tensor * shared_head_head_in_s = nullptr;
+    struct ggml_tensor * shared_head_norm      = nullptr;
 };
 
 struct llama_layer {
@@ -537,6 +541,10 @@ struct llama_model {
     // NVFP4 per-tensor scale2, input_scale for LM head
     struct ggml_tensor * output_s    = nullptr;
     struct ggml_tensor * output_in_s = nullptr;
+
+    // DFlash drafter fusion layer
+    struct ggml_tensor * dflash_fc          = nullptr;
+    struct ggml_tensor * dflash_hidden_norm = nullptr;
 
     // classifier
     struct ggml_tensor * cls       = nullptr;

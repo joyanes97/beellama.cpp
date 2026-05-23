@@ -74,7 +74,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        qkv_mixed,
             int64_t              conv_kernel_size,
             int64_t              conv_channels,
-            int                  il);
+            int                  il,
+            bool                 qkv_mixed_transposed = false);
 
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
@@ -430,6 +431,7 @@ struct llama_model_dream : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    template <bool use_cache>
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
     };
@@ -538,6 +540,21 @@ struct llama_model_qwen3vl : public llama_model_base {
         graph(const llama_model & model, const llm_graph_params & params);
     };
 
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+struct llm_build_dflash_draft : public llm_graph_context {
+    llm_build_dflash_draft(const llama_model & model, const llm_graph_params & params);
+};
+
+struct llm_build_dflash_kv_update : public llm_graph_context {
+    llm_build_dflash_kv_update(const llama_model & model, const llm_graph_params & params);
+};
+
+struct llama_model_dflash_draft : public llama_model_base {
+    llama_model_dflash_draft(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 

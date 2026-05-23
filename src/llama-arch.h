@@ -137,6 +137,8 @@ enum llm_arch {
     LLM_ARCH_LLAMA_EMBED,
     LLM_ARCH_MAINCODER,
     LLM_ARCH_KIMI_LINEAR,
+    LLM_ARCH_DFLASH,
+    LLM_ARCH_DFLASH_DRAFT,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -280,6 +282,11 @@ enum llm_kv {
     LLM_KV_KDA_HEAD_DIM,
 
     LLM_KV_WKV_HEAD_SIZE,
+
+    LLM_KV_DFLASH_BLOCK_SIZE,
+    LLM_KV_DFLASH_MASK_TOKEN_ID,
+    LLM_KV_DFLASH_TARGET_LAYER_IDS,
+    LLM_KV_DFLASH_N_TARGET_FEATURES,
 
     LLM_KV_TOKENIZER_MODEL,
     LLM_KV_TOKENIZER_PRE,
@@ -555,6 +562,10 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_HNORM,
     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+    LLM_TENSOR_DFLASH_FC,
+    LLM_TENSOR_DFLASH_HIDDEN_NORM,
+    LLM_TENSOR_DFLASH_UPSTREAM_FC,
+    LLM_TENSOR_DFLASH_UPSTREAM_HIDDEN_NORM,
 };
 
 enum llm_tensor_layer {
@@ -628,6 +639,7 @@ struct llm_tensor_info {
 std::vector<llm_arch> llm_arch_all();
 
 const char * llm_arch_name(llm_arch arch);
+bool llm_arch_is_dflash_drafter(const llm_arch & arch);
 
 llm_arch llm_arch_from_string(const std::string & name);
 

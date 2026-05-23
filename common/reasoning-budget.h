@@ -2,6 +2,7 @@
 
 #include "llama.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -40,3 +41,9 @@ struct llama_sampler * common_reasoning_budget_init(
         common_reasoning_budget_state    initial_state = REASONING_BUDGET_IDLE);
 
 common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl);
+
+bool common_reasoning_budget_force_end(struct llama_sampler * smpl);
+
+llama_token common_reasoning_budget_next_forced_token(const struct llama_sampler * smpl);
+
+size_t common_reasoning_budget_forced_token_count(const struct llama_sampler * smpl);

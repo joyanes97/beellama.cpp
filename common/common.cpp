@@ -1566,9 +1566,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.no_fused_gdn      = params.no_fused_gdn;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+
+    cparams.dflash_cross_ctx = params.speculative.dflash_cross_ctx;
 
     return cparams;
 }

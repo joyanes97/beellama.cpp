@@ -111,6 +111,7 @@ struct ring_buffer {
 struct common_sampler {
     common_params_sampling params;
 
+    const llama_vocab * vocab;
     struct llama_sampler * grmr;
     struct llama_sampler * rbudget;
     struct llama_sampler * chain;
@@ -279,7 +280,13 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
     // Feed generation prompt tokens to the grammar sampler so it advances past
     // tokens the template already placed in the prompt.
     // Only applies to output-format and tool-call grammars; user-supplied grammars must not be prefilled.
-    if (grmr && !params.grammar_lazy && common_grammar_needs_prefill(params.grammar)) {
+    const bool has_reasoning_tags =
+        !params.reasoning_budget_start.empty() &&
+        !params.reasoning_budget_end.empty();
+    const bool skip_grammar_prefill =
+        params.grammar.type == COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT &&
+        has_reasoning_tags;
+    if (grmr && !params.grammar_lazy && common_grammar_needs_prefill(params.grammar) && !skip_grammar_prefill) {
         try {
             for (const auto & token : prefill_tokens) {
                 llama_sampler_accept(grmr, token);
@@ -292,8 +299,12 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         }
     }
 
-    // reasoning budget sampler (skip when budget is unlimited unless a lazy grammar is active, which needs rbudget for thinking-block suppression)
-    if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (params.grammar_lazy || params.reasoning_budget_tokens >= 0)) {
+    // reasoning budget sampler. Tracking mode observes reasoning state even when the token budget is unlimited.
+    const bool need_rbudget_for_grammar =
+        params.grammar_lazy ||
+        (grmr && params.grammar.type == COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT);
+    if (has_reasoning_tags &&
+            (need_rbudget_for_grammar || params.reasoning_budget_tokens >= 0 || params.reasoning_budget_tracking)) {
         rbudget = common_reasoning_budget_init(
             vocab,
             params.reasoning_budget_start,
@@ -400,6 +411,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 
     auto * result = new common_sampler {
         /* .params  = */ params,
+        /* .vocab   = */ vocab,
         /* .grmr    = */ grmr,
         /* .rbudget = */ rbudget,
         /* .chain   = */ chain,
@@ -430,11 +442,36 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
     if (!gsmpl->rbudget) {
         return true;
     }
+    const auto state = common_reasoning_budget_get_state(gsmpl->rbudget);
     if (gsmpl->params.grammar_lazy) {
         // if grammar is lazy, only apply when reasoning budget is not active
-        const auto state = common_reasoning_budget_get_state(gsmpl->rbudget);
         return state == REASONING_BUDGET_IDLE || state == REASONING_BUDGET_DONE;
     }
+    if (gsmpl->params.grammar.type == COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT) {
+        return state == REASONING_BUDGET_IDLE || state == REASONING_BUDGET_DONE;
+    }
+    return true;
+}
+
+static bool reasoning_budget_is_active(common_reasoning_budget_state state) {
+    return state == REASONING_BUDGET_COUNTING || state == REASONING_BUDGET_WAITING_UTF8;
+}
+
+static bool common_sampler_force_reasoning_end_on_eog(struct common_sampler * gsmpl, llama_token id) {
+    if (!gsmpl || !gsmpl->rbudget || !gsmpl->vocab || id == LLAMA_TOKEN_NULL) {
+        return false;
+    }
+    if (!llama_vocab_is_eog(gsmpl->vocab, id)) {
+        return false;
+    }
+    if (!reasoning_budget_is_active(common_reasoning_budget_get_state(gsmpl->rbudget))) {
+        return false;
+    }
+    if (!common_reasoning_budget_force_end(gsmpl->rbudget)) {
+        return false;
+    }
+
+    LOG_WRN("%s: sampled EOG while reasoning is active; forcing reasoning end sequence instead\n", __func__);
     return true;
 }
 
@@ -472,6 +509,7 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     return new common_sampler {
         /* .params  = */ gsmpl->params,
+        /* .vocab   = */ gsmpl->vocab,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
@@ -534,6 +572,30 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+common_reasoning_budget_state common_sampler_get_reasoning_budget_state(const struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return REASONING_BUDGET_IDLE;
+    }
+
+    return common_reasoning_budget_get_state(gsmpl->rbudget);
+}
+
+bool common_sampler_force_reasoning_end(struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return false;
+    }
+
+    return common_reasoning_budget_force_end(gsmpl->rbudget);
+}
+
+size_t common_sampler_reasoning_forced_token_count(const struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return 0;
+    }
+
+    return common_reasoning_budget_forced_token_count(gsmpl->rbudget);
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -582,6 +644,14 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     id = cur_p.data[cur_p.selected].id;
 
+    if (common_sampler_force_reasoning_end_on_eog(gsmpl, id)) {
+        gsmpl->set_logits(ctx, idx);
+        llama_sampler_apply(rbudget, &cur_p);
+        llama_sampler_apply(chain, &cur_p);
+        GGML_ASSERT(cur_p.selected != -1 && "no selected token during reasoning-end repair");
+        id = cur_p.data[cur_p.selected].id;
+    }
+
     if (grammar_first || !grammar_should_apply(gsmpl)) {
         return id;
     }
@@ -618,6 +688,40 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
+static bool common_sampler_has_speculative_unsafe_grammar(const struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->grmr) {
+        return false;
+    }
+
+    // Lazy grammars are safe to speculate while still awaiting their trigger.
+    // Once triggered, grammar-constrained regions need normal full-vocab
+    // sampling and one-token streaming/parser boundaries.
+    return llama_sampler_grammar_is_active(gsmpl->grmr);
+}
+
+bool common_sampler_blocks_speculative(const struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return true;
+    }
+    if (common_sampler_has_speculative_unsafe_grammar(gsmpl)) {
+        return true;
+    }
+    return common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING;
+}
+
+bool common_sampler_supports_reduced(struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return false;
+    }
+    if (common_sampler_has_speculative_unsafe_grammar(gsmpl)) {
+        return false;
+    }
+    if (common_reasoning_budget_get_state(gsmpl->rbudget) != REASONING_BUDGET_FORCING) {
+        return true;
+    }
+    return false;
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
@@ -632,6 +736,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
 
+        if (common_sampler_blocks_speculative(gsmpl)) {
+            break;
+        }
+
         if (draft[i] != id) {
             break;
         }
@@ -642,6 +750,98 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         common_sampler_accept(gsmpl, id, true);
 
+        result.push_back(id);
+    }
+
+    return result;
+}
+
+std::vector<llama_token> common_sampler_sample_reduced_and_accept_n(
+        struct common_sampler * gsmpl,
+        const llama_token     * candidate_ids,
+        const float           * candidate_logits,
+        int32_t                 n_rows,
+        int32_t                 k,
+        const llama_tokens    & draft) {
+    GGML_ASSERT(gsmpl != nullptr);
+    GGML_ASSERT(candidate_ids != nullptr);
+    GGML_ASSERT(candidate_logits != nullptr);
+    GGML_ASSERT(n_rows == (int32_t) draft.size() + 1 && "n_rows must be draft.size() + 1");
+    GGML_ASSERT(k > 0);
+
+    // Grammar needs full-vocab rejection/resampling. Reasoning-budget tracking is
+    // safe while passthrough. A sampler that is already forcing may require a
+    // token outside the reduced candidate set and must fall back to raw logits.
+    if (!common_sampler_supports_reduced(gsmpl)) {
+        return {};
+    }
+
+    const auto tm = gsmpl->tm();
+
+    auto sample_row = [&](int32_t row) -> llama_token {
+        gsmpl->cur.resize(k);
+        const size_t row_off = (size_t) row * (size_t) k;
+        for (int32_t i = 0; i < k; ++i) {
+            gsmpl->cur[i] = llama_token_data {
+                candidate_ids[row_off + i],
+                candidate_logits[row_off + i],
+                0.0f,
+            };
+        }
+
+        // CUDA may emit reduced top-K candidates unsorted (CUB fast path). The
+        // candidate set is already bounded to K; let the CPU sampler chain sort
+        // the small array when a sampler requires descending logits.
+        gsmpl->cur_p = { gsmpl->cur.data(), gsmpl->cur.size(), -1, false };
+        if (common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING) {
+            return LLAMA_TOKEN_NULL;
+        }
+        llama_sampler_apply(gsmpl->rbudget, &gsmpl->cur_p);
+        llama_sampler_apply(gsmpl->chain, &gsmpl->cur_p);
+
+        GGML_ASSERT(gsmpl->cur_p.selected >= 0 && "no selected token during reduced sampling");
+        GGML_ASSERT((size_t) gsmpl->cur_p.selected < gsmpl->cur_p.size);
+
+        const llama_token id = gsmpl->cur_p.data[gsmpl->cur_p.selected].id;
+        if (common_sampler_force_reasoning_end_on_eog(gsmpl, id)) {
+            // The reasoning-budget sampler is now in deterministic FORCING
+            // mode. Emit the first forced token directly so reduced verifier
+            // views do not need a full raw-logits fallback for this transition.
+            return common_reasoning_budget_next_forced_token(gsmpl->rbudget);
+        }
+
+        return id;
+    };
+
+    std::vector<llama_token> result;
+    result.reserve((size_t) n_rows);
+
+    size_t i = 0;
+    for (; i < draft.size(); ++i) {
+        const llama_token id = sample_row((int32_t) i);
+        if (id == LLAMA_TOKEN_NULL) {
+            return {};
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+
+        if (common_sampler_blocks_speculative(gsmpl)) {
+            break;
+        }
+
+        if (draft[i] != id) {
+            break;
+        }
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = sample_row((int32_t) i);
+        if (id == LLAMA_TOKEN_NULL) {
+            return {};
+        }
+
+        common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
     }
 
