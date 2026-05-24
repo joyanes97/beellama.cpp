@@ -385,6 +385,14 @@ int main(int argc, char ** argv) {
                  delta_net_base.find("ggml_gated_delta_net_tree(ctx0, q, k, v, g, b, s, tree_parent_ids, persist_inter)") != std::string::npos &&
                  delta_net_base.find("cb(result, \"fgdn_tree\", il)") != std::string::npos,
         "DeltaNet must preserve the DDTree tree-aware GDN path for single-sequence multi-token verification batches");
+    ok &= expect(qwen35.find("const bool tree_mode = (tree_parent_ids != nullptr && n_seq_tokens > 1 && n_seqs == 1") != std::string::npos &&
+                 qwen35.find("ggml_ssm_conv_tree(ctx0, conv_input, conv_kernel, tree_parent_ids)") != std::string::npos &&
+                 qwen35.find("conv_output_silu = conv_output_proper;") != std::string::npos,
+        "Qwen3.5 linear attention must preserve DDTree tree-mode SSM convolution without an extra SiLU");
+    ok &= expect(qwen35moe.find("const bool tree_mode = (tree_parent_ids != nullptr && n_seq_tokens > 1 && n_seqs == 1") != std::string::npos &&
+                 qwen35moe.find("ggml_ssm_conv_tree(ctx0, conv_input, conv_kernel, tree_parent_ids)") != std::string::npos &&
+                 qwen35moe.find("conv_output_silu = conv_output_proper;") != std::string::npos,
+        "Qwen3.5-MoE linear attention must preserve DDTree tree-mode SSM convolution without an extra SiLU");
     ok &= expect(dflash_profile_h.find("GGML_DFLASH_PROFILE") != std::string::npos, "DFlash profile helper must honor profiling flag");
     ok &= expect(speculative.find("gpu_sync=%.3f ms") != std::string::npos, "DFlash ring profiling must report GPU sync time");
     ok &= expect(speculative.find("kv_cache_update requested=%d update=%d") != std::string::npos, "DFlash accept profiling must report drafter K/V cache update time");

@@ -497,10 +497,24 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
-    cb(conv_output_proper, "conv_output_raw", il);
+    const bool tree_mode = (tree_parent_ids != nullptr && n_seq_tokens > 1 && n_seqs == 1 &&
+                            n_seq_tokens <= ggml_nelements(tree_parent_ids));
 
-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+    ggml_tensor * conv_output_proper;
+    if (tree_mode) {
+        conv_output_proper = ggml_ssm_conv_tree(ctx0, conv_input, conv_kernel, tree_parent_ids);
+        cb(conv_output_proper, "conv_output_tree", il);
+    } else {
+        conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+        cb(conv_output_proper, "conv_output_raw", il);
+    }
+
+    ggml_tensor * conv_output_silu;
+    if (tree_mode) {
+        conv_output_silu = conv_output_proper;
+    } else {
+        conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+    }
     cb(conv_output_silu, "conv_output_silu", il);
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
