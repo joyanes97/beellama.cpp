@@ -7,6 +7,12 @@ set(CMAKE_WARN_UNUSED_CLI YES)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+if(DEFINED GGML_CUDA_ARCH)
+    message(FATAL_ERROR
+        "GGML_CUDA_ARCH is not a supported CMake option. "
+        "Use CMAKE_CUDA_ARCHITECTURES=120, or a semicolon-separated list such as CMAKE_CUDA_ARCHITECTURES=\"86;89;120\".")
+endif()
+
 if (NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")

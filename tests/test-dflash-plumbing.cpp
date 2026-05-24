@@ -52,6 +52,7 @@ int main(int argc, char ** argv) {
 
     const std::string root = argv[1];
     const std::string context_h = read_file(root + "/src/llama-context.h");
+    const std::string cmake_root = read_file(root + "/CMakeLists.txt");
     const std::string context_cpp = read_file(root + "/src/llama-context.cpp");
     const std::string kv_cache_h = read_file(root + "/src/llama-kv-cache.h");
     const std::string kv_cache_cpp = read_file(root + "/src/llama-kv-cache.cpp");
@@ -130,6 +131,9 @@ int main(int argc, char ** argv) {
         "prompt checkpoints must account for DFlash ring state bytes when reporting/cache-sizing checkpoint size");
     ok &= expect(common_cpp.find("ring_data.clear();") != std::string::npos,
         "prompt checkpoints must clear DFlash ring state with target/draft context state");
+    ok &= expect(cmake_root.find("GGML_CUDA_ARCH is not a supported CMake option") != std::string::npos &&
+                 cmake_root.find("CMAKE_CUDA_ARCHITECTURES=120") != std::string::npos,
+        "CMake must fail loudly when users pass obsolete GGML_CUDA_ARCH instead of CMAKE_CUDA_ARCHITECTURES");
 
     {
         const size_t zero_reuse_reset = server_context.find("n_past == 0");
