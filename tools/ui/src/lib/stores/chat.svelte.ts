@@ -33,6 +33,7 @@ import {
 	isAbortError,
 	generateConversationTitle
 } from '$lib/utils';
+import { isActiveConversationStreaming } from '$lib/utils/streaming-state';
 import {
 	MAX_INACTIVE_CONVERSATION_STATES,
 	INACTIVE_CONVERSATION_STATE_MAX_AGE_MS,
@@ -99,20 +100,22 @@ class ChatStore {
 		this.touchConversationState(convId);
 		this.chatStreamingStates.set(convId, { response, messageId });
 		if (convId === conversationsStore.activeConversation?.id) this.currentResponse = response;
+		this.syncStreamingActiveForCurrentConversation();
 	}
 	private clearChatStreaming(convId: string): void {
 		this.chatStreamingStates.delete(convId);
 		if (convId === conversationsStore.activeConversation?.id) this.currentResponse = '';
+		this.syncStreamingActiveForCurrentConversation();
 	}
 	private getChatStreaming(convId: string): { response: string; messageId: string } | undefined {
 		return this.chatStreamingStates.get(convId);
 	}
 	syncLoadingStateForChat(convId: string): void {
+		this.setActiveProcessingConversation(convId);
 		this.isLoading = this.chatLoadingStates.get(convId) || false;
 		const s = this.chatStreamingStates.get(convId);
 		this.currentResponse = s?.response || '';
-		this.isStreamingActive = s !== undefined;
-		this.setActiveProcessingConversation(convId);
+		this.syncStreamingActiveForCurrentConversation();
 		// Sync streaming content to activeMessages so UI displays current content
 		if (s?.response && s?.messageId) {
 			const idx = conversationsStore.findMessageIndex(s.messageId);
@@ -133,6 +136,7 @@ class ChatStore {
 		this.activeProcessingState = conversationId
 			? this.processingStates.get(conversationId) || null
 			: null;
+		this.syncStreamingActiveForCurrentConversation();
 	}
 
 	getProcessingState(conversationId: string): ApiProcessingState | null {
@@ -158,8 +162,12 @@ class ChatStore {
 		return this.activeProcessingState;
 	}
 
-	private setStreamingActive(active: boolean): void {
-		this.isStreamingActive = active;
+	private syncStreamingActiveForCurrentConversation(): void {
+		const activeConversationId = this.activeConversationId ?? conversationsStore.activeConversation?.id;
+		this.isStreamingActive = isActiveConversationStreaming(
+			activeConversationId,
+			this.chatStreamingStates.keys()
+		);
 	}
 
 	isStreaming(): boolean {
@@ -661,14 +669,13 @@ class ChatStore {
 		};
 
 		const cleanupStreamingState = () => {
-			this.setStreamingActive(false);
 			this.setChatLoading(convId, false);
 			this.clearChatStreaming(convId);
 			this.setProcessingState(convId, null);
 		};
 
-		this.setStreamingActive(true);
 		this.setActiveProcessingConversation(convId);
+		this.setChatStreaming(convId, streamedContent, currentMessageId);
 		const abortController = this.getOrCreateAbortController(convId);
 
 		const streamCallbacks: ChatStreamCallbacks = {
@@ -821,7 +828,6 @@ class ChatStore {
 				}
 			},
 			onError: async (error: Error) => {
-				this.setStreamingActive(false);
 				if (isAbortError(error)) {
 					cleanupStreamingState();
 					// If aborted with a pending message (e.g. "Send immediately"), re-send it
@@ -943,7 +949,6 @@ class ChatStore {
 	}
 	async stopGenerationForChat(convId: string): Promise<void> {
 		await this.savePartialResponseIfNeeded(convId);
-		this.setStreamingActive(false);
 		this.abortRequest(convId);
 		this.setChatLoading(convId, false);
 		this.clearChatStreaming(convId);
