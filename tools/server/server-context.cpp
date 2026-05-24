@@ -4821,6 +4821,7 @@ private:
         const char * dflash_multiseq_block_reason = "not-pure-tg";
         llama_seq_id dflash_multiseq_block_seq = -1;
         int dflash_multiseq_n_unique = 0;
+        int dflash_multiseq_rows[LLAMA_DFLASH_MAX_SLOTS] = {};
         const bool dflash_tg_batch_all_spec_slots = [&]() {
             if (!dflash_pure_tg_batch) {
                 return false;
@@ -4830,25 +4831,30 @@ private:
             for (int32_t t = 0; t < n_tg_tokens; ++t) {
                 for (int32_t k = 0; k < batch.n_seq_id[t]; ++k) {
                     const llama_seq_id seq = batch.seq_id[t][k];
-                    bool seen = false;
+                    int seq_idx = -1;
                     for (int s = 0; s < dflash_multiseq_n_unique; ++s) {
                         if (unique_seqs[s] == seq) {
-                            seen = true;
+                            seq_idx = s;
                             break;
                         }
                     }
-                    if (seen) {
-                        continue;
+                    if (seq_idx < 0) {
+                        if (dflash_multiseq_n_unique >= (int) LLAMA_DFLASH_MAX_SLOTS) {
+                            dflash_multiseq_block_reason = "too-many-seqs";
+                            dflash_multiseq_block_seq = seq;
+                            return false;
+                        }
+                        seq_idx = dflash_multiseq_n_unique;
+                        unique_seqs[dflash_multiseq_n_unique++] = seq;
                     }
-                    if (dflash_multiseq_n_unique >= (int) LLAMA_DFLASH_MAX_SLOTS) {
-                        dflash_multiseq_block_reason = "too-many-seqs";
-                        dflash_multiseq_block_seq = seq;
-                        return false;
-                    }
-                    unique_seqs[dflash_multiseq_n_unique++] = seq;
+                    dflash_multiseq_rows[seq_idx]++;
                 }
             }
 
+            // Graph-embedded GPU hidden capture stores one fixed row count per
+            // ubatch. Uneven per-seq rows split into multiple ubatches and would
+            // leave the longer slot with only the final ubatch's hidden rows.
+            int expected_rows = -1;
             for (int s = 0; s < dflash_multiseq_n_unique; ++s) {
                 const llama_seq_id seq = unique_seqs[s];
                 auto it = std::find_if(slots.begin(), slots.end(), [seq](const server_slot & slot) {
@@ -4856,6 +4862,20 @@ private:
                 });
                 if (it == slots.end() || !it->can_speculate() || !it->get_spec()) {
                     dflash_multiseq_block_reason = "non-dflash-slot";
+                    dflash_multiseq_block_seq = seq;
+                    return false;
+                }
+
+                const int rows = dflash_multiseq_rows[s];
+                if (rows <= 0) {
+                    dflash_multiseq_block_reason = "empty-seq";
+                    dflash_multiseq_block_seq = seq;
+                    return false;
+                }
+                if (expected_rows < 0) {
+                    expected_rows = rows;
+                } else if (rows != expected_rows) {
+                    dflash_multiseq_block_reason = "uneven-rows";
                     dflash_multiseq_block_seq = seq;
                     return false;
                 }

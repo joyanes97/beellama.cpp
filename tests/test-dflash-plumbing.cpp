@@ -1425,6 +1425,9 @@ int main(int argc, char ** argv) {
     ok &= expect(server_context.find("dflash_tg_batch_all_spec_slots") != std::string::npos &&
                  server_context.find("dflash multiseq target batching disabled") != std::string::npos,
         "server must not multi-seq batch pure TG DFlash views unless every sequence owns DFlash state");
+    ok &= expect(server_context.find("dflash_multiseq_rows") != std::string::npos &&
+                 server_context.find("uneven-rows") != std::string::npos,
+        "server must not multi-seq batch DFlash target views with uneven per-slot rows because GPU hidden capture is per-ubatch");
     ok &= expect(common_h.find("int32_t dflash_max_slots = 0") != std::string::npos &&
                  server_context.find("params_base.speculative.dflash_max_slots > 0") != std::string::npos &&
                  server_context.find("DFlash enabled for all %d slots") != std::string::npos,
