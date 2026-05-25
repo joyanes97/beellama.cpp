@@ -150,7 +150,7 @@ Advanced draft placement:
 | `--context-shift`, `--no-context-shift` | Disabled | Infinite generation via KV shifting when supported. Disabled under multimodal. |
 | `--swa-full` | Disabled | Full-size SWA cache for models where it is supported. |
 | `-ctxcp`, `--ctx-checkpoints`, `--swa-checkpoints N` | `32` | Max prompt context checkpoints per slot. Important for long prompt reuse and contexts where speculative decoding needs checkpoints. |
-| `-cpent`, `--checkpoint-every-n-tokens N` | `8192` | Create checkpoints during prefill every N tokens. `-1` disables cadence. |
+| `-cms`, `--checkpoint-min-step N` | `256` | Minimum spacing between prompt context checkpoints. `0` disables the spacing limit. |
 | `-cram`, `--cache-ram N` | `8192` MiB | Server prompt-cache RAM limit. `-1` no limit, `0` disables the prompt cache subsystem. |
 | `--cache-prompt`, `--no-cache-prompt` | Enabled | Whether request prompts can use prompt caching. |
 | `--cache-reuse N` | `0` disabled | Minimum chunk size to reuse from cache through KV shifting. Disabled under multimodal and unsupported contexts. |

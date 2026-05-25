@@ -282,7 +282,7 @@ The default command targets 24 GB VRAM with Q5_K_S. If you are running out of me
 2. **Switch cache types.** Replace `q5_0` / `q4_1` with `q4_0` / `q4_0` first. On CUDA, `turbo3_tcq` for both K and V squeezes further; `turbo2_tcq` is the last resort. On Metal, use `turbo3` for both K and V if `q4_0` is too large.
 3. **Drop the target quantization.** Move from Q5_K_S to Q4_K_M or Q4_K_S, or as a last resort to IQ4_XS.
 4. **Reduce `--spec-dflash-cross-ctx`.** Lowering from 1024 to 512 saves VRAM at the cost of less context for the drafter's cross-attention.
-5. **Lower context checkpoints.** Each checkpoint stores a full KV state copy. The default caps at 32 checkpoints per slot (`--ctx-checkpoints 32`), taken every 8192 tokens during prefill (`--checkpoint-every-n-tokens 8192`). At long contexts this adds up. Drop to 16 or 24 to free RAM:
+5. **Lower context checkpoints.** Each checkpoint stores a full KV state copy. The default caps at 32 checkpoints per slot (`--ctx-checkpoints 32`) with a minimum spacing of 256 tokens (`--checkpoint-min-step 256`). At long contexts this adds up. Drop to 16 or 24 to free RAM:
 
    ```
    --ctx-checkpoints 16

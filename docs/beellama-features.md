@@ -245,7 +245,7 @@ Bee does not hide the important llama.cpp server knobs. The fork keeps the contr
 - `--ctx-size` for model context allocation
 - `-b` and `-ub` for logical and physical prompt batch size
 - `--kv-unified` for a unified KV buffer across slots
-- `--ctx-checkpoints` and `--checkpoint-every-n-tokens` for prompt context checkpoints
+- `--ctx-checkpoints` and `--checkpoint-min-step` for prompt context checkpoints
 - `--cache-ram` and `--cache-idle-slots` for server prompt-cache RAM behavior
 - `--cache-type-k` and `--cache-type-v` for independent K/V cache precision
 - `--flash-attn on|off|auto` for Flash Attention selection

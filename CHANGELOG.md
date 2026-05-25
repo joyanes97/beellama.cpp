@@ -3,6 +3,7 @@
 ## v0.3.0
 
 - Rebased BeeLlama onto a much newer llama.cpp upstream while preserving the fork-specific DFlash, CopySpec, DDTree, TurboQuant/TCQ, Tom TQ, Gemma, Qwen, multimodal, reasoning, and server changes that were still production-ready.
+- Merged post-rebase llama.cpp upstream through `35c9b1f39`, preserving upstream history while adapting conflicts around Bee's DFlash/MTP server paths, checkpointing, CUDA/Metal/TurboQuant surfaces, UI state, and CI split workflows.
 - Adopted the upstream speculative-decoding framework shape for Bee features, including the newer MTP support, parallel drafting infrastructure, backend sampling path, and upstream spec argument naming.
 - Preserved DFlash explicit selection and DFlash draft-GGUF auto-detection, including support for both Bee/buun `dflash-draft` and upstream-style `dflash` draft metadata.
 - Kept upstream raw `--spec-draft-n-max` default at `3`, but applies DFlash's effective omitted draft max of `16` only when DFlash is explicit or auto-detected.
@@ -31,7 +32,9 @@
 - Preserved Gemma3 full image chunks, Gemma multimodal precision/profiling hooks where still relevant, and flat-DFlash multimodal compatibility while keeping tree and non-DFlash speculation disabled under multimodal where unsupported.
 - Suppressed leading reasoning/thinking syntax in streamed title generation so session titles do not surface stray tags such as closing thinking markers.
 - Preserved the reasoning loop guard, malformed tool-call filtering, request-level speculative overrides, and DFlash/mmproj server guardrails on the newer upstream server.
+- Adopted upstream MTP/cache and server fixes after the v0.3.0 rebase: MTP draft contexts now use draft KV cache types instead of inheriting target `--cache-type-k/v`, draft/MTP fit memory is reserved before target fitting, and prompt checkpoints are placed around the latest user turn with `--checkpoint-min-step`.
 - Brought in upstream server/runtime improvements after v0.2.0, including draft/MTP resource cleanup on sleep, prompt token counts in `/slots`, router and model metadata fixes, API compatibility updates, and newer built-in server tooling.
+- Brought in upstream post-rebase runtime/backend updates including NVFP4 MTP scale tensors, GGUF callback/buffer initialization APIs, CUDA FWHT handling for Hadamard-hinted matmuls, parallel quant LUT initialization, Metal device IDs, cpp-httplib 0.45.1, and UI continue/agentic-loop fixes.
 - Brought in upstream conversion, UI/app, Docker, CI, backend, model, tokenizer, and documentation updates from the newer llama.cpp base while keeping BeeLlama-specific docs and workflow metadata.
 - Expanded parser and DFlash plumbing tests for removed args, DFlash default normalization, DFlash-only no-op behavior, auto-detect preservation, multi-GPU policy helpers, per-layer capture/tape allocation, device-aware replay, CUDA device restoration, and adaptive Draft-Max behavior.
 
