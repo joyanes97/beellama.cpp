@@ -1769,9 +1769,16 @@ int main(int argc, char ** argv) {
                  server_context.find("params_dft.devices = { target_output_dev, nullptr };") != std::string::npos &&
                  server_context.find("params_dft.main_gpu = 0;") != std::string::npos &&
                  server_context.find("const bool dflash_auto_device_mismatch") != std::string::npos &&
-                 server_context.find("llama_model_n_devices(model_dft.get()) > 1 || dflash_auto_device_mismatch") != std::string::npos &&
+                 server_context.find("const bool dflash_auto_single_gpu_reload") != std::string::npos &&
+                 server_context.find("target_output_is_gpu && dflash_auto_device_mismatch") != std::string::npos &&
                  server_context.find("DFlash draft model uses shared target output tensor on device") != std::string::npos,
         "DFlash draft auto-placement must include the target output device used by shared tensors");
+    ok &= expect(server_context.find("server_backend_dev_is_dflash_shared_output_compatible") != std::string::npos &&
+                 server_context.find("GGML_BACKEND_DEVICE_TYPE_META") != std::string::npos &&
+                 server_context.find("const bool target_output_is_meta") != std::string::npos &&
+                 server_context.find("params_dft.split_mode = LLAMA_SPLIT_MODE_TENSOR;") != std::string::npos &&
+                 server_context.find("server_model_supports_device_buffer(model_dft.get(), target_output_dev)") != std::string::npos,
+        "DFlash draft auto-placement must keep a tensor-split drafter when shared target tensors live in a Meta buffer");
     ok &= expect(model_cpp.find("!llm_arch_is_dflash_drafter(model->arch)") != std::string::npos,
         "public DFlash hparam accessors must return zero for non-DFlash model architectures");
     ok &= expect(server_context.find("failed to initialize slot speculative decoding context") != std::string::npos,
