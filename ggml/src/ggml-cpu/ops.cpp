@@ -5730,6 +5730,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_0:
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
@@ -9513,8 +9514,6 @@ static void ggml_compute_forward_ssm_conv_tree_f32(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
     const int ir  = ir1 - ir0;
-
-    const int ncs = src0->ne[0]; // d_conv - 1 + n_t
 
     for (int i3 = 0; i3 < n_s; ++i3) {
         for (int i2 = 0; i2 < n_t; ++i2) {
