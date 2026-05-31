@@ -335,5 +335,19 @@ int main() {
         assert_not_triggered(guard.check(SERVER_LOOP_REGION_REASONING));
     }
 
+    {
+        server_loop_guard guard(test_params());
+        accept_many(guard, std::vector<llama_token>(1200, 42), SERVER_LOOP_REGION_REASONING);
+        assert(guard.check(SERVER_LOOP_REGION_REASONING).triggered);
+
+        common_reasoning_loop_guard_params params = test_params();
+        params.mode = COMMON_REASONING_LOOP_GUARD_OFF;
+        guard.configure(params);
+        accept_many(guard, std::vector<llama_token>(1200, 42), SERVER_LOOP_REGION_REASONING);
+        assert(!guard.should_check(SERVER_LOOP_REGION_REASONING, false, false));
+        assert_not_triggered(guard.check(SERVER_LOOP_REGION_REASONING));
+        assert(guard.seen(SERVER_LOOP_REGION_REASONING) == 1200);
+    }
+
     return 0;
 }

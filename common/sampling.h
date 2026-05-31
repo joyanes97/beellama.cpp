@@ -6,6 +6,7 @@
 #include "reasoning-budget.h"
 
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,15 @@
 
 struct common_sampler;
 
+struct common_sampler_accept_info {
+    llama_token token = LLAMA_TOKEN_NULL;
+    bool is_generated = false;
+    common_reasoning_budget_state reasoning_state_before = REASONING_BUDGET_IDLE;
+    common_reasoning_budget_state reasoning_state_after  = REASONING_BUDGET_IDLE;
+};
+
+using common_sampler_accept_callback = std::function<bool(const common_sampler_accept_info &)>;
+
 // llama_sampler API overloads
 
 // note: can mutate params in some cases
@@ -45,6 +55,7 @@ void common_sampler_free(struct common_sampler * gsmpl);
 
 // if is_generated is true, the token is accepted by the sampling chain, the reasoning budget sampler, and the grammar sampler
 void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated);
+common_sampler_accept_info common_sampler_accept_with_info(struct common_sampler * gsmpl, llama_token token, bool is_generated);
 void                    common_sampler_reset (struct common_sampler * gsmpl);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
 
@@ -88,7 +99,13 @@ bool common_sampler_stops_speculative_accept(const struct common_sampler * gsmpl
 //
 // returns at least 1 token, up to idxs.size()
 //
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context  * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens    & draft,
+        bool                    grammar_first = false,
+        const common_sampler_accept_callback & on_accept = {});
 
 // DFlash verifier fast path: run the existing sampler chain over compact per-row
 // candidate lists instead of full-vocab logits. `candidate_ids` and
@@ -100,10 +117,16 @@ std::vector<llama_token> common_sampler_sample_reduced_and_accept_n(
         const float           * candidate_logits,
         int32_t                 n_rows,
         int32_t                 k,
-        const llama_tokens    & draft);
+        const llama_tokens    & draft,
+        const common_sampler_accept_callback & on_accept = {});
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context  * ctx,
+        const llama_tokens    & draft,
+        bool                    grammar_first = false,
+        const common_sampler_accept_callback & on_accept = {});
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 

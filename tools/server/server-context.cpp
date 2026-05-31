@@ -241,7 +241,8 @@ static std::vector<llama_token> speculative_reject_sample(
         int32_t                & n_exact,
         int32_t                & n_prob_accept,
         int32_t                & n_reject,
-        int32_t                & n_no_prob) {
+        int32_t                & n_no_prob,
+        const common_sampler_accept_callback & on_accept = {}) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
     std::vector<llama_token> result;
@@ -253,14 +254,28 @@ static std::vector<llama_token> speculative_reject_sample(
         *std::max_element(idxs.begin(), idxs.end());
     log_norm_cache ln_cache(ctx_tgt, temp, max_batch_idx);
     const bool grammar_active_at_start = common_sampler_has_active_grammar(smpl);
+    bool stopped_by_callback = false;
+    auto accept = [&](llama_token id) {
+        if (on_accept) {
+            const auto info = common_sampler_accept_with_info(smpl, id, true);
+            result.push_back(id);
+            return on_accept(info);
+        }
+
+        common_sampler_accept(smpl, id, true);
+        result.push_back(id);
+        return true;
+    };
 
     for (size_t i = 0; i < draft.size(); i++) {
         const llama_token target_token = common_sampler_sample(smpl, ctx_tgt, idxs[i]);
 
         if (target_token == draft[i]) {
-            common_sampler_accept(smpl, target_token, true);
-            result.push_back(target_token);
             n_exact++;
+            if (!accept(target_token)) {
+                stopped_by_callback = true;
+                break;
+            }
             if (common_sampler_stops_speculative_accept(smpl, grammar_active_at_start)) {
                 break;
             }
@@ -268,9 +283,8 @@ static std::vector<llama_token> speculative_reject_sample(
         }
 
         if (i >= draft_log_probs.size()) {
-            common_sampler_accept(smpl, target_token, true);
-            result.push_back(target_token);
             n_no_prob++;
+            (void) accept(target_token);
             break;
         }
 
@@ -285,24 +299,24 @@ static std::vector<llama_token> speculative_reject_sample(
         }
 
         if (uniform(rng) < accept_prob) {
-            common_sampler_accept(smpl, draft[i], true);
-            result.push_back(draft[i]);
             n_prob_accept++;
+            if (!accept(draft[i])) {
+                stopped_by_callback = true;
+                break;
+            }
             if (common_sampler_stops_speculative_accept(smpl, grammar_active_at_start)) {
                 break;
             }
         } else {
-            common_sampler_accept(smpl, target_token, true);
-            result.push_back(target_token);
             n_reject++;
+            (void) accept(target_token);
             break;
         }
     }
 
-    if (result.size() == draft.size() && !common_sampler_stops_speculative_accept(smpl, grammar_active_at_start)) {
+    if (!stopped_by_callback && result.size() == draft.size() && !common_sampler_stops_speculative_accept(smpl, grammar_active_at_start)) {
         const llama_token bonus = common_sampler_sample(smpl, ctx_tgt, idxs[draft.size()]);
-        common_sampler_accept(smpl, bonus, true);
-        result.push_back(bonus);
+        (void) accept(bonus);
     }
 
     return result;
@@ -508,7 +522,8 @@ static std::vector<llama_token> dflash_sample_reduced_verify(
         struct llama_context  * ctx,
         const std::vector<int> & idxs,
         const llama_tokens    & draft,
-        int                     top_k) {
+        int                     top_k,
+        const common_sampler_accept_callback & on_accept = {}) {
     if ((int) idxs.size() != (int) draft.size() + 1 || top_k <= 0) {
         return {};
     }
@@ -533,7 +548,32 @@ static std::vector<llama_token> dflash_sample_reduced_verify(
     }
 
     return common_sampler_sample_reduced_and_accept_n(
-        smpl, candidate_ids.data(), candidate_logits.data(), (int32_t) idxs.size(), top_k, draft);
+        smpl, candidate_ids.data(), candidate_logits.data(), (int32_t) idxs.size(), top_k, draft, on_accept);
+}
+
+static bool server_reasoning_budget_state_is_reasoning(common_reasoning_budget_state state) {
+    return state == REASONING_BUDGET_COUNTING ||
+           state == REASONING_BUDGET_WAITING_UTF8 ||
+           state == REASONING_BUDGET_FORCING;
+}
+
+static bool server_accept_info_is_reasoning(const common_sampler_accept_info & info) {
+    return server_reasoning_budget_state_is_reasoning(info.reasoning_state_before) ||
+           server_reasoning_budget_state_is_reasoning(info.reasoning_state_after);
+}
+
+static std::string server_loop_guard_reason_to_string(const server_loop_guard_result & result) {
+    std::string reason = result.kind.empty() ? "unknown" : result.kind;
+    if (result.period > 0) {
+        reason += string_format(" period=%d", result.period);
+    }
+    if (result.coverage > 0) {
+        reason += string_format(" coverage=%d", result.coverage);
+    }
+    if (result.score > 0.0f) {
+        reason += string_format(" score=%.3f", (double) result.score);
+    }
+    return reason;
 }
 
 constexpr int HTTP_POLLING_SECONDS = 1;
@@ -3095,6 +3135,8 @@ private:
             slot.smpl.reset();
         }
 
+        slot.loop_guard.configure(task.params.reasoning_loop_guard);
+
         if (slot.can_speculate() && task.need_sampling() && slot.dm_adaptive) {
             const int configured_base_n_max = common_speculative_n_max(slot.spec.get(), task.params.speculative);
             const int base_n_max = dflash_effective_adaptive_base_n_max(
@@ -3116,7 +3158,83 @@ private:
         return true;
     }
 
+    bool loop_guard_accept_enabled(const server_slot & slot) const {
+        return slot.task &&
+               slot.smpl &&
+               slot.task->params.reasoning_loop_guard.mode != COMMON_REASONING_LOOP_GUARD_OFF &&
+               slot.task->params.sampling.reasoning_budget_tracking;
+    }
+
+    bool handle_loop_guard_accept(server_slot & slot, const common_sampler_accept_info & info) {
+        if (!loop_guard_accept_enabled(slot) || !info.is_generated) {
+            return true;
+        }
+
+        const bool is_reasoning = server_accept_info_is_reasoning(info);
+        if (is_reasoning) {
+            slot.reasoning_output_tokens++;
+        } else {
+            slot.visible_output_tokens++;
+            return true;
+        }
+
+        const bool forcing_reasoning_end = info.reasoning_state_before == REASONING_BUDGET_FORCING ||
+                                           info.reasoning_state_after  == REASONING_BUDGET_FORCING;
+        if (forcing_reasoning_end) {
+            return true;
+        }
+
+        slot.loop_guard.accept(info.token, SERVER_LOOP_REGION_REASONING);
+
+        const bool token_is_eog = llama_vocab_is_eog(vocab, info.token);
+        if (!slot.loop_guard.should_check(SERVER_LOOP_REGION_REASONING, token_is_eog, forcing_reasoning_end)) {
+            return true;
+        }
+
+        const auto check = slot.loop_guard.check(SERVER_LOOP_REGION_REASONING);
+        if (!check.triggered) {
+            return true;
+        }
+
+        slot.loop_guard_triggered = true;
+        slot.loop_guard_reason = server_loop_guard_reason_to_string(check);
+
+        const auto & params = slot.task->params.reasoning_loop_guard;
+        if (params.mode == COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE &&
+                slot.loop_guard_interventions < params.interventions_max &&
+                common_sampler_force_reasoning_end(slot.smpl.get())) {
+            slot.loop_guard_interventions++;
+            slot.loop_guard_action = "force-close";
+            SLT_WRN(slot, "reasoning loop guard force-closing hidden reasoning: %s\n", slot.loop_guard_reason.c_str());
+            return false;
+        }
+
+        slot.loop_guard_action = "stop";
+        slot.stop = STOP_TYPE_LIMIT;
+        slot.stop_detail = "reasoning_loop_guard";
+        slot.has_next_token = false;
+        SLT_WRN(slot, "reasoning loop guard stopping generation: %s\n", slot.loop_guard_reason.c_str());
+        return false;
+    }
+
+    common_sampler_accept_callback make_loop_guard_accept_callback(server_slot & slot) {
+        if (!loop_guard_accept_enabled(slot)) {
+            return {};
+        }
+
+        const int32_t remaining = slot.remaining_generation_budget(params_base);
+        return [this, &slot, remaining, n_accepted = 0](const common_sampler_accept_info & info) mutable {
+            n_accepted++;
+            if (!handle_loop_guard_accept(slot, info)) {
+                return false;
+            }
+            return remaining == -1 || n_accepted < remaining;
+        };
+    }
+
     bool process_token(completion_token_output & result, server_slot & slot) {
+        const bool stopped_before_process = slot.stop != STOP_TYPE_NONE && !slot.has_next_token;
+
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
         slot.sampled = result.tok;
@@ -3125,7 +3243,7 @@ private:
         if (slot.task->params.return_tokens) {
             slot.generated_tokens.push_back(result.tok);
         }
-        slot.has_next_token = true;
+        slot.has_next_token = !stopped_before_process;
 
         // check if there is incomplete UTF-8 character at the end
         bool incomplete = validate_utf8(slot.generated_text) < slot.generated_text.size();
@@ -3185,7 +3303,7 @@ private:
             }
         }
 
-        if (incomplete) {
+        if (incomplete && !stopped_before_process) {
             slot.has_next_token = true;
         }
 
@@ -3438,6 +3556,11 @@ private:
         res->stopping_word         = slot.stopping_word;
         res->stop                  = slot.stop;
         res->stop_detail           = slot.stop_detail;
+        res->reasoning_output_tokens = slot.reasoning_output_tokens;
+        res->visible_output_tokens   = slot.visible_output_tokens;
+        res->loop_guard_triggered    = slot.loop_guard_triggered;
+        res->loop_guard_action       = slot.loop_guard_action;
+        res->loop_guard_reason       = slot.loop_guard_reason;
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
 
         res->verbose           = slot.task->params.verbose;
@@ -5855,7 +5978,12 @@ private:
 
                 slot.i_batch = -1;
 
-                common_sampler_accept(slot.smpl.get(), id, true);
+                if (loop_guard_accept_enabled(slot)) {
+                    const auto accept_info = common_sampler_accept_with_info(slot.smpl.get(), id, true);
+                    (void) handle_loop_guard_accept(slot, accept_info);
+                } else {
+                    common_sampler_accept(slot.smpl.get(), id, true);
+                }
 
                 // update DFlash hidden state ring buffer with the decoded token's hidden states.
                 // Skip on the first sample after prompt: common_speculative_begin() above already
@@ -5963,10 +6091,12 @@ private:
                                             && params_base.sampling.temp > 0.0f
                                             && !slot.draft_log_probs.empty()
                                             && !grammar_active_for_accept;
+                    const auto on_accept = make_loop_guard_accept_callback(slot);
                     if (use_rejection) {
                         prefetched.ids = speculative_reject_sample(slot.smpl.get(), ctx_tgt, slot.spec_draft,
                             slot.spec_i_batch, slot.draft_log_probs, params_base.sampling.temp, slot.reject_rng,
-                            slot.n_reject_exact, slot.n_reject_prob_accept, slot.n_reject_reject, slot.n_reject_no_prob);
+                            slot.n_reject_exact, slot.n_reject_prob_accept, slot.n_reject_reject, slot.n_reject_no_prob,
+                            on_accept);
                     } else {
                         if (dflash_reduced_verify_ready && dflash_verify_plan.enabled) {
                             std::vector<int> reduced_idxs = slot.spec_i_batch;
@@ -5974,12 +6104,12 @@ private:
                                 idx -= dflash_reduced_verify_view_start;
                             }
                             prefetched.ids = dflash_sample_reduced_verify(slot.smpl.get(), ctx_tgt, reduced_idxs,
-                                    slot.spec_draft, dflash_reduced_verify_top_k);
+                                    slot.spec_draft, dflash_reduced_verify_top_k, on_accept);
                             if (prefetched.ids.empty()) {
                                 GGML_ABORT("DFlash reduced verifier output missing; falling back is unsafe because raw logits were not copied\n");
                             }
                         } else {
-                            prefetched.ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                            prefetched.ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, on_accept);
                         }
                     }
                     prefetched.sample_us = ggml_time_us() - t_sample_start;
@@ -6065,8 +6195,19 @@ private:
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
 
                     common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                    const server_loop_guard loop_guard_save = slot.loop_guard;
+                    const int32_t loop_guard_interventions_save = slot.loop_guard_interventions;
+                    const bool loop_guard_triggered_save = slot.loop_guard_triggered;
+                    const std::string loop_guard_action_save = slot.loop_guard_action;
+                    const std::string loop_guard_reason_save = slot.loop_guard_reason;
+                    const int32_t reasoning_output_tokens_save = slot.reasoning_output_tokens;
+                    const int32_t visible_output_tokens_save = slot.visible_output_tokens;
+                    const stop_type stop_save = slot.stop;
+                    const std::string stop_detail_save = slot.stop_detail;
+                    const bool has_next_token_save = slot.has_next_token;
 
-                    auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                    const auto on_accept = make_loop_guard_accept_callback(slot);
+                    auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, on_accept);
                     slot.spec_i_batch.clear();
 
                     GGML_ASSERT(accepted.size() >= 1);
@@ -6104,6 +6245,16 @@ private:
 
                             slot.prompt.tokens.keep_first(ckpt.n_tokens);
                             slot.smpl = std::move(smpl_save);
+                            slot.loop_guard = loop_guard_save;
+                            slot.loop_guard_interventions = loop_guard_interventions_save;
+                            slot.loop_guard_triggered = loop_guard_triggered_save;
+                            slot.loop_guard_action = loop_guard_action_save;
+                            slot.loop_guard_reason = loop_guard_reason_save;
+                            slot.reasoning_output_tokens = reasoning_output_tokens_save;
+                            slot.visible_output_tokens = visible_output_tokens_save;
+                            slot.stop = stop_save;
+                            slot.stop_detail = stop_detail_save;
+                            slot.has_next_token = has_next_token_save;
 
                             continue;
                         }
@@ -6197,6 +6348,7 @@ private:
                     const int32_t max_batch_idx = slot.spec_i_batch.empty() ? -1 :
                         *std::max_element(slot.spec_i_batch.begin(), slot.spec_i_batch.end());
                     log_norm_cache ln_cache(ctx_tgt, params_base.sampling.temp, max_batch_idx);
+                    const auto on_accept = make_loop_guard_accept_callback(slot);
                     int current = 0;
                     while (true) {
                         const llama_token id = common_sampler_sample(slot.smpl.get(), ctx_tgt, slot.spec_i_batch[current]);
@@ -6205,14 +6357,20 @@ private:
                         auto it = slot.draft_tree.child_maps[current].find(id);
                         if (it != slot.draft_tree.child_maps[current].end()) {
                             const int accepted_child = it->second;
-                            common_sampler_accept(slot.smpl.get(), id, true);
+                            bool keep_accepting = true;
+                            if (on_accept) {
+                                const auto info = common_sampler_accept_with_info(slot.smpl.get(), id, true);
+                                keep_accepting = on_accept(info);
+                            } else {
+                                common_sampler_accept(slot.smpl.get(), id, true);
+                            }
                             current = accepted_child;
                             tree_commit_n = current;
                             if (current > slot.draft_tree.main_path_len) {
                                 tree_accepted_on_main_path = false;
                             }
                             slot.n_reject_exact++;
-                            if (common_sampler_blocks_speculative(slot.smpl.get())) {
+                            if (!keep_accepting || common_sampler_blocks_speculative(slot.smpl.get())) {
                                 speculative_has_bonus = false;
                                 break;
                             }
@@ -6245,7 +6403,13 @@ private:
                                 }
                                 if (accepted_child > 0) {
                                     const llama_token accepted_token = slot.draft_tree.tokens[accepted_child - 1];
-                                    common_sampler_accept(slot.smpl.get(), accepted_token, true);
+                                    bool keep_accepting = true;
+                                    if (on_accept) {
+                                        const auto info = common_sampler_accept_with_info(slot.smpl.get(), accepted_token, true);
+                                        keep_accepting = on_accept(info);
+                                    } else {
+                                        common_sampler_accept(slot.smpl.get(), accepted_token, true);
+                                    }
                                     ids.back() = accepted_token;
                                     current = accepted_child;
                                     tree_commit_n = accepted_child;
@@ -6253,7 +6417,7 @@ private:
                                         tree_accepted_on_main_path = false;
                                     }
                                     slot.n_reject_prob_accept++;
-                                    if (common_sampler_blocks_speculative(slot.smpl.get())) {
+                                    if (!keep_accepting || common_sampler_blocks_speculative(slot.smpl.get())) {
                                         speculative_has_bonus = false;
                                         break;
                                     }
@@ -6262,7 +6426,12 @@ private:
                             }
                             slot.n_reject_reject++;
                         }
-                        common_sampler_accept(slot.smpl.get(), id, true);
+                        if (on_accept) {
+                            const auto info = common_sampler_accept_with_info(slot.smpl.get(), id, true);
+                            (void) on_accept(info);
+                        } else {
+                            common_sampler_accept(slot.smpl.get(), id, true);
+                        }
                         break;
                     }
 
@@ -6287,10 +6456,12 @@ private:
                                             && params_base.sampling.temp > 0.0f
                                             && !slot.draft_log_probs.empty()
                                             && !grammar_active_for_accept;
+                    const auto on_accept = make_loop_guard_accept_callback(slot);
                     if (use_rejection) {
                         ids = speculative_reject_sample(slot.smpl.get(), ctx_tgt, slot.spec_draft,
                             slot.spec_i_batch, slot.draft_log_probs, params_base.sampling.temp, slot.reject_rng,
-                            slot.n_reject_exact, slot.n_reject_prob_accept, slot.n_reject_reject, slot.n_reject_no_prob);
+                            slot.n_reject_exact, slot.n_reject_prob_accept, slot.n_reject_reject, slot.n_reject_no_prob,
+                            on_accept);
                     } else {
                         if (dflash_reduced_verify_ready && dflash_verify_plan.enabled) {
                             std::vector<int> reduced_idxs = slot.spec_i_batch;
@@ -6298,12 +6469,12 @@ private:
                                 idx -= dflash_reduced_verify_view_start;
                             }
                             ids = dflash_sample_reduced_verify(slot.smpl.get(), ctx_tgt, reduced_idxs,
-                                    slot.spec_draft, dflash_reduced_verify_top_k);
+                                    slot.spec_draft, dflash_reduced_verify_top_k, on_accept);
                             if (ids.empty()) {
                                 GGML_ABORT("DFlash reduced verifier output missing; falling back is unsafe because raw logits were not copied\n");
                             }
                         } else {
-                            ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                            ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, on_accept);
                         }
                     }
                     profile_accept_lap(profile_accept_sample_us);

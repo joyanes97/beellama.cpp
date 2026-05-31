@@ -1106,6 +1106,15 @@ std::vector<llama_token> common_tokenize(
                         bool   add_special,
                         bool   parse_special = false);
 
+// Tokenizes text for sampler-internal sentinels. Some tokenizers add a dummy
+// leading whitespace token when tokenizing standalone non-whitespace text; that
+// token is not part of the literal sequence generated at the current cursor.
+std::vector<llama_token> common_tokenize_sampler_text(
+    const struct llama_vocab * vocab,
+           const std::string & text,
+                        bool   add_special,
+                        bool   parse_special = false);
+
 // tokenizes a token into a piece, optionally renders special/control tokens
 // should work similar to Python's `tokenizer.id_to_piece`
 std::string common_token_to_piece(

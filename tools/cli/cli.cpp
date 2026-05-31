@@ -107,12 +107,12 @@ struct cli_context {
 
                 if (!chat_params.thinking_start_tag.empty()) {
                     task.params.sampling.reasoning_budget_start =
-                        common_tokenize(vocab, chat_params.thinking_start_tag, false, true);
+                        common_tokenize_sampler_text(vocab, chat_params.thinking_start_tag, false, true);
                 }
                 task.params.sampling.reasoning_budget_end =
-                    common_tokenize(vocab, chat_params.thinking_end_tag, false, true);
+                    common_tokenize_sampler_text(vocab, chat_params.thinking_end_tag, false, true);
                 task.params.sampling.reasoning_budget_forced =
-                    common_tokenize(vocab, defaults.sampling.reasoning_budget_message + chat_params.thinking_end_tag, false, true);
+                    common_tokenize_sampler_text(vocab, defaults.sampling.reasoning_budget_message + chat_params.thinking_end_tag, false, true);
             }
 
             rd.post_task({std::move(task)});

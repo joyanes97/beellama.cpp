@@ -8,7 +8,6 @@
 #include "ggml.h"
 
 #include <algorithm>
-#include <cctype>
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -265,13 +264,9 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
     std::vector<llama_token> prefill_tokens;
     if (!params.generation_prompt.empty()) {
         GGML_ASSERT(vocab != nullptr);
-        auto tokens = common_tokenize(vocab, params.generation_prompt, false, true);
+        auto tokens = common_tokenize_sampler_text(vocab, params.generation_prompt, false, true);
         for (size_t i = 0; i < tokens.size(); i++) {
             std::string piece = common_token_to_piece(vocab, tokens[i], true);
-            if (i == 0 && std::isspace(piece[0]) && !std::isspace(params.generation_prompt[0])) {
-                // Some tokenizers will add a space before the first special token, need to exclude
-                continue;
-            }
             LOG_DBG("%s: prefill token: %d = %s\n", __func__, tokens[i], piece.c_str());
             prefill_tokens.push_back(tokens[i]);
         }
@@ -475,18 +470,36 @@ static bool common_sampler_force_reasoning_end_on_eog(struct common_sampler * gs
     return true;
 }
 
-void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated) {
+static common_sampler_accept_info common_sampler_accept_impl(
+        struct common_sampler            * gsmpl,
+        llama_token                        token,
+        bool                               is_generated,
+        common_sampler_accept_info       * info) {
+    common_sampler_accept_info local;
+    local.token = token;
+    local.is_generated = is_generated;
+
     if (!gsmpl) {
-        return;
+        if (info) {
+            *info = local;
+        }
+        return local;
     }
 
     const auto tm = gsmpl->tm();
 
     // grammar_should_apply() checks the reasoning budget state, so calculate this before we accept
     const auto accept_grammar = is_generated && grammar_should_apply(gsmpl);
+    if (info) {
+        local.reasoning_state_before = common_reasoning_budget_get_state(gsmpl->rbudget);
+        local.reasoning_state_after = local.reasoning_state_before;
+    }
 
     if (gsmpl->rbudget && is_generated) {
         llama_sampler_accept(gsmpl->rbudget, token);
+        if (info) {
+            local.reasoning_state_after = common_reasoning_budget_get_state(gsmpl->rbudget);
+        }
     }
 
     if (gsmpl->grmr && accept_grammar) {
@@ -496,6 +509,21 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     llama_sampler_accept(gsmpl->chain, token);
 
     gsmpl->prev.push_back(token);
+
+    if (info) {
+        *info = local;
+    }
+    return local;
+}
+
+void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated) {
+    common_sampler_accept_impl(gsmpl, token, is_generated, nullptr);
+}
+
+common_sampler_accept_info common_sampler_accept_with_info(struct common_sampler * gsmpl, llama_token token, bool is_generated) {
+    common_sampler_accept_info info;
+    common_sampler_accept_impl(gsmpl, token, is_generated, &info);
+    return info;
 }
 
 void common_sampler_reset(struct common_sampler * gsmpl) {
@@ -740,21 +768,38 @@ bool common_sampler_supports_reduced(struct common_sampler * gsmpl) {
     return false;
 }
 
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context  * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens    & draft,
+        bool                    grammar_first,
+        const common_sampler_accept_callback & on_accept) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
     const bool grammar_active_at_start = common_sampler_has_active_grammar(gsmpl);
+    auto accept = [&](llama_token id) {
+        if (on_accept) {
+            const auto info = common_sampler_accept_with_info(gsmpl, id, true);
+            result.push_back(id);
+            return on_accept(info);
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+        return true;
+    };
 
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
-        common_sampler_accept(gsmpl, id, true);
-
-        result.push_back(id);
+        if (!accept(id)) {
+            break;
+        }
 
         if (common_sampler_stops_speculative_accept(gsmpl, grammar_active_at_start)) {
             break;
@@ -768,9 +813,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
-        common_sampler_accept(gsmpl, id, true);
-
-        result.push_back(id);
+        (void) accept(id);
     }
 
     return result;
@@ -782,7 +825,8 @@ std::vector<llama_token> common_sampler_sample_reduced_and_accept_n(
         const float           * candidate_logits,
         int32_t                 n_rows,
         int32_t                 k,
-        const llama_tokens    & draft) {
+        const llama_tokens    & draft,
+        const common_sampler_accept_callback & on_accept) {
     GGML_ASSERT(gsmpl != nullptr);
     GGML_ASSERT(candidate_ids != nullptr);
     GGML_ASSERT(candidate_logits != nullptr);
@@ -837,6 +881,17 @@ std::vector<llama_token> common_sampler_sample_reduced_and_accept_n(
     result.reserve((size_t) n_rows);
 
     const bool grammar_active_at_start = common_sampler_has_active_grammar(gsmpl);
+    auto accept = [&](llama_token id) {
+        if (on_accept) {
+            const auto info = common_sampler_accept_with_info(gsmpl, id, true);
+            result.push_back(id);
+            return on_accept(info);
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+        return true;
+    };
 
     size_t i = 0;
     for (; i < draft.size(); ++i) {
@@ -845,8 +900,9 @@ std::vector<llama_token> common_sampler_sample_reduced_and_accept_n(
             return {};
         }
 
-        common_sampler_accept(gsmpl, id, true);
-        result.push_back(id);
+        if (!accept(id)) {
+            break;
+        }
 
         if (common_sampler_stops_speculative_accept(gsmpl, grammar_active_at_start)) {
             break;
@@ -863,20 +919,24 @@ std::vector<llama_token> common_sampler_sample_reduced_and_accept_n(
             return {};
         }
 
-        common_sampler_accept(gsmpl, id, true);
-        result.push_back(id);
+        (void) accept(id);
     }
 
     return result;
 }
 
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first) {
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context  * ctx,
+        const llama_tokens    & draft,
+        bool                    grammar_first,
+        const common_sampler_accept_callback & on_accept) {
     std::vector<int> idxs(draft.size() + 1);
     for (size_t i = 0; i < idxs.size(); ++i) {
         idxs[i] = i;
     }
 
-    return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+    return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first, on_accept);
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {

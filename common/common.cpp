@@ -16,6 +16,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdarg>
+#include <cctype>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -1679,6 +1680,23 @@ std::vector<llama_token> common_tokenize(
         result.resize(n_tokens);
     }
     return result;
+}
+
+std::vector<llama_token> common_tokenize_sampler_text(
+    const struct llama_vocab * vocab,
+           const std::string & text,
+                        bool   add_special,
+                        bool   parse_special) {
+    std::vector<llama_token> tokens = common_tokenize(vocab, text, add_special, parse_special);
+    if (!tokens.empty() && !text.empty()) {
+        const std::string piece = common_token_to_piece(vocab, tokens.front(), true);
+        if (!piece.empty() &&
+                std::isspace((unsigned char) piece.front()) &&
+                !std::isspace((unsigned char) text.front())) {
+            tokens.erase(tokens.begin());
+        }
+    }
+    return tokens;
 }
 
 std::string common_token_to_piece(const struct llama_context * ctx, llama_token token, bool special) {

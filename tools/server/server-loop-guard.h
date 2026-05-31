@@ -24,6 +24,7 @@ class server_loop_guard {
 public:
     explicit server_loop_guard(common_reasoning_loop_guard_params params = {});
 
+    void configure(common_reasoning_loop_guard_params params);
     void reset();
     void accept(llama_token token, server_loop_guard_region region);
     bool should_check(server_loop_guard_region region, bool token_is_eog, bool forcing_reasoning_end) const;
