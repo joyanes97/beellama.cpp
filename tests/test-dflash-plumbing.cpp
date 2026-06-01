@@ -591,6 +591,21 @@ int main(int argc, char ** argv) {
                  delta_net_base.find("ggml_gated_delta_net_tree(ctx0, q, k, v, g, b, s, tree_parent_ids, persist_inter)") != std::string::npos &&
                  delta_net_base.find("cb(result, \"fgdn_tree\", il)") != std::string::npos,
         "DeltaNet must preserve the DDTree tree-aware GDN path for single-sequence multi-token verification batches");
+    {
+        const std::string fgdn_resolve = slice_between(
+            context_cpp,
+            "if (cparams.auto_fgdn) {\n        LLAMA_LOG_INFO(\"%s: resolving fused Gated Delta Net support:",
+            "        cparams.auto_fgdn = false;");
+        ok &= expect(fgdn_resolve.find("graph_reserve(1, n_seqs, n_outputs, mctx.get(), true)") != std::string::npos &&
+                     fgdn_resolve.find("device_gdn != device_kv") != std::string::npos,
+            "fused GDN auto mode must rely on scheduler capability/device-placement probing");
+        ok &= expect(context_cpp.find("fused Gated Delta Net disabled (non-CUDA backend)") == std::string::npos &&
+                     context_cpp.find("have_cuda_gpu") == std::string::npos,
+            "fused GDN must not be disabled before probing just because the backend is ROCm");
+        ok &= expect(cuda_cpp.find("case GGML_OP_GATED_DELTA_NET:") != std::string::npos &&
+                     cuda_cpp.find("#ifdef GGML_USE_MUSA\n            return false;\n#else\n            return true;\n#endif // GGML_USE_MUSA") != std::string::npos,
+            "CUDA/HIP backend support must keep GATED_DELTA_NET enabled for ROCm while excluding MUSA");
+    }
     ok &= expect(qwen35.find("const bool tree_mode = (tree_parent_ids != nullptr && n_seq_tokens > 1 && n_seqs == 1") != std::string::npos &&
                  qwen35.find("ggml_ssm_conv_tree(ctx0, conv_input, conv_kernel, tree_parent_ids)") != std::string::npos &&
                  qwen35.find("conv_output_silu = conv_output_proper;") != std::string::npos,
