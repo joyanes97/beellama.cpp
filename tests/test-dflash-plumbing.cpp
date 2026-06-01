@@ -1947,7 +1947,7 @@ int main(int argc, char ** argv) {
     ok &= expect(speculative.find("adaptive_n_draft") == std::string::npos &&
                  speculative.find("n_low_accept") == std::string::npos &&
                  speculative.find("GGML_DFLASH_DISABLE_ACCEPT_SHRINK") == std::string::npos &&
-                 server_context.find("int n_draft_max = (dm_adaptive && adaptive_n_max >= 0) ? adaptive_n_max : base_n_max") != std::string::npos &&
+                 server_context.find("int n_draft_max = (dm_adaptive && adaptive_n_max >= 0) ? std::min((int) adaptive_n_max, base_n_max) : base_n_max") != std::string::npos &&
                  server_context.find("else if (dm_adaptive && adaptive_n_max == 0)") != std::string::npos,
         "DFlash-local accept shrink must be removed and non-adaptive mode must ignore adaptive state");
     ok &= expect(server_context.find("server_adaptive_dm_should_preserve_for_continuation(sim_best, f_keep)") != std::string::npos &&
@@ -1957,8 +1957,9 @@ int main(int argc, char ** argv) {
     ok &= expect(server_context.find("adaptive dm: reset state for LRU slot selection") != std::string::npos &&
                  server_context.find("adaptive dm: reset state for canceled task") != std::string::npos,
         "adaptive DFlash request state must reset on fresh LRU slots and canceled tasks");
-    ok &= expect(server_context.find("slot.reset_profit_if_config_changed(task.params.speculative, base_n_max") != std::string::npos,
-        "adaptive DFlash profit controller must refresh its config key when a task is launched");
+    ok &= expect(server_context.find("slot.reset_profit_if_config_changed(task.params.speculative, base_n_max") != std::string::npos &&
+                 server_context.find("&task.params.sampling") != std::string::npos,
+        "adaptive DFlash profit controller must refresh its config key with task sampling when a task is launched");
     ok &= expect(server_context.find("dflash_effective_adaptive_base_n_max") != std::string::npos &&
                  server_context.find("const int base_n_max = dflash_effective_adaptive_base_n_max(") != std::string::npos,
         "adaptive DFlash profit decisions must use the effective flat DFlash draft cap, not only the configured nominal max");

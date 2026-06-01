@@ -314,7 +314,7 @@ Adaptive Draft-Max is enabled by default for DFlash. It can reduce the active dr
 | --- | ---: | --- |
 | `--spec-dm-adaptive`, `--no-spec-dm-adaptive` | Enabled | Enable or disable adaptive depth. Disable for fixed-depth benchmarks. |
 | `--spec-dm-controller MODE` | `profit` | `profit` or `fringe`. |
-| `--spec-dm-probe-interval N` | `16` | Cycles to wait before trying a speculative cycle when speculation is off. |
+| `--spec-dm-probe-interval N` | `16` | Minimum cycles to wait before trying a speculative cycle when speculation is off; `profit` backs off after failed wake probes. |
 | `--spec-dm-probe-fraction F` | `0.25` | Fraction of base_n_max to use as the probe depth when speculation is off. |
 | `--spec-dm-explore-interval N` | `12` | Draft at a higher depth every N cycles to collect timing data beyond the current n_max. |
 | `--spec-dm-off-dwell N` | `8` | Consecutive cycles below the profit/fringe threshold before speculation is disabled. |
@@ -326,7 +326,7 @@ Adaptive Draft-Max is enabled by default for DFlash. It can reduce the active dr
 | `--spec-dm-profit-lower-margin F` | `0.05` | Relative margin a lower depth must exceed to replace the current depth. |
 | `--spec-dm-profit-ewma-alpha F` | `0.15` | Smoothing factor for acceptance and timing running averages. |
 | `--spec-dm-profit-min-samples N` | `3` | Minimum observations per position/depth before scoring that depth as ready. |
-| `--spec-dm-profit-warmup N` | `0` | Positive-depth warmup cycles after the no-spec baseline is seeded (0 = use --spec-dm-profit-min-samples). |
+| `--spec-dm-profit-warmup N` | `0` | Minimum measured samples for each initial positive-depth profit probe after the no-spec baseline is seeded (0 = use --spec-dm-profit-min-samples). |
 | `--spec-dm-profit-baseline-interval N` | `1024` | Active speculative cycles between no-spec baseline reprobes (0 = disabled). |
 
 Use `profit` for normal serving. Use `fringe` when you want behavior tied more directly to observed draft acceptance near the active tail. Use `--no-spec-dm-adaptive --spec-draft-n-max N` when comparing fixed draft depths.

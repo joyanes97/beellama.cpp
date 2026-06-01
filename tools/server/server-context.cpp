@@ -1018,11 +1018,15 @@ struct server_slot : server_adaptive_dm_state {
 
         const int n_draft_min = common_speculative_n_min(get_spec(), task->params.speculative);
 
-        const int base_n_max = common_speculative_n_max(get_spec(), task->params.speculative);
+        const int configured_base_n_max = common_speculative_n_max(get_spec(), task->params.speculative);
+        const bool use_profit_controller = dm_adaptive && dm_controller == COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
+        const int base_n_max = use_profit_controller && profit_has_key && profit_key.base_n_max > 0
+            ? std::min(configured_base_n_max, (int) profit_key.base_n_max)
+            : configured_base_n_max;
         const int probe_n_max = server_adaptive_dm_probe_n_max(base_n_max, dm_probe_fraction);
-        int n_draft_max = (dm_adaptive && adaptive_n_max >= 0) ? adaptive_n_max : base_n_max;
+        int n_draft_max = (dm_adaptive && adaptive_n_max >= 0) ? std::min((int) adaptive_n_max, base_n_max) : base_n_max;
 
-        if (dm_adaptive && dm_controller == COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT) {
+        if (use_profit_controller) {
             if (profit_baseline_probe_pending) {
                 return 0;
             }
@@ -1034,33 +1038,33 @@ struct server_slot : server_adaptive_dm_state {
                 return 0;
             }
 
-            if (profit_warmup_cycles > 0) {
-                n_draft_max = base_n_max;
+            if (adaptive_n_max < 0) {
                 if (advance_adaptive_probe) {
-                    profit_warmup_cycles--;
+                    adaptive_n_max = 0;
                 }
-            } else if (adaptive_n_max < 0) {
-                if (advance_adaptive_probe) {
-                    adaptive_n_max = base_n_max;
-                    const int32_t warmup = dm_profit_warmup > 0 ? dm_profit_warmup : dm_profit_min_samples;
-                    profit_warmup_cycles = warmup;
-                }
-                n_draft_max = base_n_max;
+                return 0;
             } else if (adaptive_n_max == 0) {
-                const bool probe_now = adaptive_probe_counter + 1 >= dm_probe_interval;
+                if (!profit_baseline_ready()) {
+                    return 0;
+                }
+                const bool probe_now = adaptive_probe_counter + 1 >= profit_off_probe_interval();
                 if (!probe_now) {
                     if (advance_adaptive_probe) {
                         adaptive_probe_counter++;
                     }
                     return 0;
                 }
+                const int profit_probe_n_max = [&]() {
+                    const int unready = profit_next_unready_probe_depth(base_n_max);
+                    return unready > 0 ? unready : probe_n_max;
+                }();
                 if (advance_adaptive_probe) {
                     adaptive_probe_counter = 0;
-                    adaptive_n_max = base_n_max;
+                    adaptive_n_max = profit_probe_n_max;
                 }
-                n_draft_max = base_n_max;
+                n_draft_max = profit_probe_n_max;
             } else {
-                n_draft_max = adaptive_n_max;
+                n_draft_max = std::min((int) adaptive_n_max, base_n_max);
                 if (advance_adaptive_probe) {
                     explore_counter++;
                     if (explore_counter % dm_explore_interval == 0) {
@@ -3238,7 +3242,8 @@ private:
             const int base_n_max = dflash_effective_adaptive_base_n_max(
                     ctx_dft_shared.get(), task.params.speculative, configured_base_n_max);
             slot.reset_profit_if_config_changed(task.params.speculative, base_n_max,
-                                                (int32_t) slot.prompt.n_tokens());
+                                                (int32_t) slot.prompt.n_tokens(),
+                                                &task.params.sampling);
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
@@ -4485,6 +4490,9 @@ private:
                 const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
                 const int original_n_max = params_spec.n_max;
                 params_spec.n_max = std::min(params_spec.n_max, n_draft_max);
+                if (slot.dm_adaptive && server_adaptive_dm_uses_profit_controller(slot.dm_controller)) {
+                    slot.profit_pending_requested_n_max = n_draft_max;
+                }
                 slot.n_tokens_before_draft = slot.prompt.n_tokens();
                 slot.n_pos_before_draft = slot.prompt.tokens.pos_next();
                 const bool use_ddtree = params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
@@ -6375,6 +6383,9 @@ private:
                     if (slot.dm_adaptive) {
                         slot.observe_profit_acceptance((int) n_draft, (int) ids.size() - 1);
                         slot.profit_pending = true;
+                        if (slot.profit_pending_requested_n_max <= 0) {
+                            slot.profit_pending_requested_n_max = (int32_t) n_draft;
+                        }
                         slot.profit_pending_n_draft = (int32_t) n_draft;
                         slot.profit_pending_n_accepted = (int32_t) ids.size() - 1;
                         slot.profit_pending_tree = false;
@@ -6642,6 +6653,9 @@ private:
                     const int n_accepted = n_accepted_draft;
                     slot.observe_profit_acceptance((int) n_draft, n_accepted);
                     slot.profit_pending = true;
+                    if (slot.profit_pending_requested_n_max <= 0) {
+                        slot.profit_pending_requested_n_max = (int32_t) n_draft;
+                    }
                     slot.profit_pending_n_draft = (int32_t) n_draft;
                     slot.profit_pending_n_accepted = n_accepted;
                     slot.profit_pending_tree = false;
@@ -6984,7 +6998,11 @@ private:
                 const float cycle_ms  = (t_cycle_total_now / 1000.0f) * dflash_profit_shared_scale;
 
                 slot.observe_profit_timing(
+                        slot.profit_pending_requested_n_max > 0
+                            ? slot.profit_pending_requested_n_max
+                            : slot.profit_pending_n_draft,
                         slot.profit_pending_n_draft,
+                        slot.profit_pending_n_accepted,
                         draft_ms,
                         verify_ms,
                         accept_ms,
@@ -7004,10 +7022,12 @@ private:
 
                 apply_profit_decision(slot);
                 slot.profit_pending = false;
+                slot.profit_pending_requested_n_max = 0;
             }
         } else {
             for (auto & slot : slots) {
                 slot.profit_pending = false;
+                slot.profit_pending_requested_n_max = 0;
             }
         }
         llama_set_dflash_consume_reduced(ctx_tgt, false);
@@ -7017,6 +7037,8 @@ private:
                 profit_baseline_slot->state == SLOT_STATE_GENERATING) {
             const int64_t t_cycle_total_now = ggml_time_us() - t_cycle_start;
             profit_baseline_slot->observe_profit_timing(
+                    0,
+                    0,
                     0,
                     t_draft_total / 1000.0f,
                     t_verify_total / 1000.0f,

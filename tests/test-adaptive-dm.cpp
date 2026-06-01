@@ -19,6 +19,17 @@ static void assert_candidates(int base_n_max, const std::vector<int> & expected)
     assert(build_candidates(base_n_max) == expected);
 }
 
+static void observe_profit_cycle(
+        server_adaptive_dm_state & state,
+        int requested_n_max,
+        int actual_n_draft,
+        int n_accepted,
+        float cycle_ms) {
+    state.observe_profit_acceptance(actual_n_draft, n_accepted);
+    state.observe_profit_timing(requested_n_max, actual_n_draft, n_accepted,
+            0.0f, cycle_ms, 0.0f, cycle_ms);
+}
+
 int main() {
     const float min = 0.30f;
     const float max = 0.65f;
@@ -152,19 +163,19 @@ int main() {
     assert(state.fringe_epoch == 5);
     assert(state.fringe_epoch_reached[2] == 0);
     assert(state.fringe_epoch_accepted[2] == 0);
-    // profit data should be preserved across request resets
-    assert(state.profit_pos_accept_ewma[2] == 0.75f);
-    assert(state.profit_pos_samples[2] == 9);
-    assert(state.profit_depth[4].samples == 3);
-    assert(state.profit_baseline.samples == 2);
-    assert(state.profit_has_key == true);
+    // request resets are prompt-change boundaries, so local profit telemetry is cleared
+    assert(state.profit_pos_accept_ewma[2] == 0.0f);
+    assert(state.profit_pos_samples[2] == 0);
+    assert(state.profit_depth[4].samples == 0);
+    assert(state.profit_baseline.samples == 0);
+    assert(state.profit_has_key == false);
     assert(!state.profit_pending);
     assert(state.profit_last_recommended_n == -1);
     assert(state.profit_consecutive_below_profit == 0);
-    assert(state.profit_warmup_cycles == 0);
     assert(state.profit_cycles_since_baseline == 0);
     assert(!state.profit_baseline_probe_pending);
     assert(state.profit_baseline_probe_resume_n == -1);
+    assert(state.profit_off_probe_failures == 0);
 
     state.fringe_epoch = 2;
     state.fringe_ring_idx = 0;
@@ -215,35 +226,55 @@ int main() {
     state.dm_profit_min_samples = 1;
     state.dm_off_dwell = 1;
     state.adaptive_n_max = 2;
-    state.observe_profit_acceptance(2, 0);
-    state.observe_profit_timing(2, 15.0f, 60.0f, 5.0f, 80.0f);
+    observe_profit_cycle(state, 2, 2, 0, 80.0f);
     {
         const int recommended = state.decide_profit_n_max(8);
-        assert(recommended > 0);
+        assert(recommended == 0);
         state.apply_profit_recommendation(recommended);
     }
-    state.observe_profit_timing(0, 0.0f, 30.0f, 0.0f, 30.0f);
-    assert(state.decide_profit_n_max(8) == 0);
+    state.observe_profit_timing(0, 0, 0, 0.0f, 30.0f, 0.0f, 30.0f);
+    assert(state.decide_profit_n_max(8) == 4);
 
-    // test warmup: fresh profit controllers start with positive-depth DFlash,
-    // and baseline samples are only expected while explicitly off/probing.
+    // test cold start: fresh profit controllers seed no-spec baseline before
+    // any positive-depth DFlash cycle, then probe shallow depth first.
     state.reset_profit_state();
     state.dm_profit_min_samples = 2;
     state.dm_off_dwell = 1;
-    state.profit_warmup_cycles = 3;
-    assert(state.decide_profit_n_max(8) == 8);
-    assert(!state.profit_expects_baseline_sample());
-    state.adaptive_n_max = 0;
+    assert(state.decide_profit_n_max(8) == 0);
     assert(state.profit_expects_baseline_sample());
+    state.observe_profit_timing(0, 0, 0, 0.0f, 30.0f, 0.0f, 30.0f);
+    assert(state.decide_profit_n_max(8) == 0);
+    state.observe_profit_timing(0, 0, 0, 0.0f, 32.0f, 0.0f, 32.0f);
+    assert(state.profit_baseline_ready());
+    assert(state.decide_profit_n_max(8) == 2);
 
-    // test reset_request_state preserves profit data but resets request counters
+    // Baseline scoring keeps the best observed no-spec cycle so a cold first
+    // token after prompt prefill does not make weak DFlash look profitable.
+    state.reset_profit_state();
+    state.dm_profit_min_samples = 2;
+    state.observe_profit_timing(0, 0, 0, 0.0f, 100.0f, 0.0f, 100.0f);
+    state.observe_profit_timing(0, 0, 0, 0.0f, 25.0f, 0.0f, 25.0f);
+    assert(state.profit_baseline_ready());
+    assert(state.profit_score_for_depth(0) >= 39.9f);
+
+    // test explicit warmup requires extra measured samples for the initial
+    // positive-depth probe before moving to the next depth.
+    state.reset_profit_state();
+    state.dm_profit_min_samples = 1;
+    state.dm_profit_warmup = 2;
+    state.observe_profit_timing(0, 0, 0, 0.0f, 30.0f, 0.0f, 30.0f);
+    assert(state.decide_profit_n_max(8) == 2);
+    observe_profit_cycle(state, 2, 2, 1, 60.0f);
+    assert(state.decide_profit_n_max(8) == 2);
+    observe_profit_cycle(state, 2, 2, 1, 60.0f);
+    assert(state.decide_profit_n_max(8) == 4);
+
+    // test reset_request_state clears prompt-local profit data and request counters
     state.reset_profit_state();
     state.dm_profit_min_samples = 1;
     state.dm_off_dwell = 1;
     state.adaptive_n_max = 4;
-    state.profit_warmup_cycles = 2;
-    state.observe_profit_acceptance(4, 2);
-    state.observe_profit_timing(4, 20.0f, 50.0f, 3.0f, 73.0f);
+    observe_profit_cycle(state, 4, 4, 2, 73.0f);
     state.profit_pending = true;
     state.profit_consecutive_below_profit = 3;
 
@@ -252,12 +283,12 @@ int main() {
     assert(state.adaptive_n_max == -1);
     assert(state.profit_pending == false);
     assert(state.profit_consecutive_below_profit == 0);
-    assert(state.profit_warmup_cycles == 0);
     assert(state.profit_last_recommended_n == -1);
-    // profit data preserved
-    assert(state.profit_pos_samples[0] == 1);
-    assert(state.profit_depth[4].samples == 1);
-    assert(state.profit_pos_accept_ewma[0] > 0.0f);
+    assert(state.profit_off_probe_failures == 0);
+    // prompt-local profit data cleared
+    assert(state.profit_pos_samples[0] == 0);
+    assert(state.profit_depth[4].samples == 0);
+    assert(state.profit_pos_accept_ewma[0] == 0.0f);
 
     state.dm_profit_min_samples = 1;
     common_params_speculative empty_spec;
@@ -270,21 +301,30 @@ int main() {
     spec.dflash_cross_ctx = 1024;
     spec.sample_temp = 0.0f;
     spec.p_min = 0.0f;
-    state.observe_profit_timing(2, 10.0f, 20.0f, 5.0f, 35.0f);
-    state.reset_profit_if_config_changed(spec, 8, 0);
+    common_params_sampling sampling;
+    sampling.temp = 0.6f;
+    sampling.top_k = 20;
+    sampling.top_p = 1.0f;
+    sampling.min_p = 0.0f;
+    state.observe_profit_timing(2, 2, 1, 10.0f, 20.0f, 5.0f, 35.0f);
+    state.reset_profit_if_config_changed(spec, 8, 0, &sampling);
     assert(state.profit_has_key);
     assert(state.profit_depth[2].samples == 0);
     assert(state.adaptive_n_max == -1);
-    state.observe_profit_timing(2, 10.0f, 20.0f, 5.0f, 35.0f);
-    state.reset_profit_if_config_changed(spec, 8, 0);
+    state.observe_profit_timing(2, 2, 1, 10.0f, 20.0f, 5.0f, 35.0f);
+    state.reset_profit_if_config_changed(spec, 8, 0, &sampling);
     assert(state.profit_depth[2].samples == 1);
+    sampling.temp = 0.2f;
+    state.reset_profit_if_config_changed(spec, 8, 0, &sampling);
+    assert(state.profit_depth[2].samples == 0);
+    state.observe_profit_timing(2, 2, 1, 10.0f, 20.0f, 5.0f, 35.0f);
     state.adaptive_n_max = 8;
     spec.dflash_cross_ctx = 2048;
-    state.reset_profit_if_config_changed(spec, 8, 0);
+    state.reset_profit_if_config_changed(spec, 8, 0, &sampling);
     assert(state.profit_depth[2].samples == 0);
     assert(state.adaptive_n_max == -1);
 
-    // test a bucket transition resets profit stats without forcing cold-start baseline collection
+    // test a bucket transition resets profit stats and forces a new cold-start baseline
     {
         server_adaptive_dm_state bucket;
         common_params_speculative bucket_spec;
@@ -296,9 +336,9 @@ int main() {
         bucket_spec.p_min = 0.0f;
 
         bucket.reset_profit_if_config_changed(bucket_spec, 16, 1000);
-        bucket.observe_profit_timing(0, 0.0f, 30.0f, 0.0f, 30.0f);
-        bucket.observe_profit_timing(0, 0.0f, 31.0f, 0.0f, 31.0f);
-        bucket.observe_profit_timing(0, 0.0f, 32.0f, 0.0f, 32.0f);
+        bucket.observe_profit_timing(0, 0, 0, 0.0f, 30.0f, 0.0f, 30.0f);
+        bucket.observe_profit_timing(0, 0, 0, 0.0f, 31.0f, 0.0f, 31.0f);
+        bucket.observe_profit_timing(0, 0, 0, 0.0f, 32.0f, 0.0f, 32.0f);
         bucket.apply_profit_recommendation(14);
         assert(bucket.profit_baseline_ready());
         assert(!bucket.profit_expects_baseline_sample());
@@ -306,8 +346,8 @@ int main() {
         bucket.reset_profit_if_config_changed(bucket_spec, 16, 9000);
         assert(bucket.adaptive_n_max == -1);
         assert(!bucket.profit_baseline_ready());
-        assert(!bucket.profit_expects_baseline_sample());
-        assert(bucket.decide_profit_n_max(16) == 16);
+        assert(bucket.profit_expects_baseline_sample());
+        assert(bucket.decide_profit_n_max(16) == 0);
     }
 
     // test cross-depth estimation
@@ -320,12 +360,11 @@ int main() {
 
         // simulate 3 cycles at depth 8 with high acceptance
         for (int i = 0; i < 3; i++) {
-            est.observe_profit_acceptance(8, 6);
-            est.observe_profit_timing(8, 10.0f, 55.0f, 2.0f, 67.0f);
+            observe_profit_cycle(est, 8, 8, 6, 67.0f);
         }
         // baseline
         for (int i = 0; i < 3; i++) {
-            est.observe_profit_timing(0, 0.0f, 22.0f, 0.0f, 22.0f);
+            est.observe_profit_timing(0, 0, 0, 0.0f, 22.0f, 0.0f, 22.0f);
         }
 
         // depth 8 should be ready, depth 4 should be estimated
@@ -333,11 +372,8 @@ int main() {
         assert(recommended > 0);
     }
 
-    // Estimated lower-depth candidates are useful for upward exploration, but
-    // must not demote an active full-depth DFlash horizon before the lower
-    // horizon has direct timing evidence. Early Gemma DFlash cycles can have
-    // low tail acceptance and make shallower estimated candidates look better
-    // even though the full horizon wins after the request warms up.
+    // Direct measured lower-depth candidates can demote an active full-depth
+    // DFlash horizon when they produce better output tokens per millisecond.
     {
         server_adaptive_dm_state est;
         est.dm_profit_min_samples = 3;
@@ -345,47 +381,46 @@ int main() {
         est.dm_profit_lower_margin = 0.01f;
         est.adaptive_n_max = 15;
 
-        est.observe_profit_acceptance(15, 2);
-        est.observe_profit_timing(15, 24.9f, 62.3f, 1.0f, 88.3f);
-        est.observe_profit_acceptance(15, 2);
-        est.observe_profit_timing(15, 6.9f, 64.3f, 1.1f, 72.3f);
-        est.observe_profit_acceptance(15, 1);
-        est.observe_profit_timing(15, 6.2f, 53.4f, 0.9f, 60.5f);
+        for (int i = 0; i < 3; ++i) {
+            observe_profit_cycle(est, 15, 15, 1, 90.0f);
+            observe_profit_cycle(est, 4, 4, 2, 45.0f);
+            observe_profit_cycle(est, 8, 8, 1, 80.0f);
+        }
+        for (int i = 0; i < 3; ++i) {
+            est.observe_profit_timing(0, 0, 0, 0.0f, 35.0f, 0.0f, 35.0f);
+        }
 
-        assert(est.decide_profit_n_max(15) == 15);
+        assert(est.decide_profit_n_max(15) == 4);
     }
 
-    // Sustained low acceptance alone must not hard-disable DFlash for the rest
-    // of a request. The controller can still choose baseline later, but only
-    // from real baseline-vs-spec profit data, not from draft acceptance alone.
+    // Sustained low acceptance without a baseline must collect baseline data,
+    // not keep serving an unmeasured speculative depth.
     {
         server_adaptive_dm_state weak;
         weak.dm_profit_min_samples = 3;
         weak.adaptive_n_max = 15;
 
         for (int i = 0; i < 12; ++i) {
-            weak.observe_profit_acceptance(15, 0);
-            weak.observe_profit_timing(15, 18.0f, 115.0f, 2.0f, 135.0f);
+            observe_profit_cycle(weak, 15, 15, 0, 135.0f);
         }
 
         const int rec = weak.decide_profit_n_max(15);
-        assert(rec > 0);
-        assert(rec <= 15);
+        assert(rec == 0);
 
         weak.reset_request_state();
         assert(weak.profit_last_recommended_n == -1);
     }
 
-    // test baseline-best shuts speculation fully off after dwell instead of only downshifting
+    // test baseline-best shuts speculation fully off after the initial probe set is measured
     {
         server_adaptive_dm_state weak;
         weak.dm_profit_min_samples = 1;
-        weak.dm_off_dwell = 2;
+        weak.dm_off_dwell = 8;
         weak.adaptive_n_max = 8;
-        weak.observe_profit_timing(0, 0.0f, 25.0f, 0.0f, 25.0f);
-        weak.observe_profit_acceptance(8, 0);
-        weak.observe_profit_timing(8, 10.0f, 90.0f, 5.0f, 105.0f);
-        assert(weak.decide_profit_n_max(8) == 8);
+        weak.observe_profit_timing(0, 0, 0, 0.0f, 25.0f, 0.0f, 25.0f);
+        observe_profit_cycle(weak, 2, 2, 0, 80.0f);
+        observe_profit_cycle(weak, 4, 4, 0, 90.0f);
+        observe_profit_cycle(weak, 8, 8, 0, 105.0f);
         assert(weak.decide_profit_n_max(8) == 0);
     }
 
@@ -403,17 +438,16 @@ int main() {
         reprobe_spec.p_min = 0.0f;
         reprobe.reset_profit_if_config_changed(reprobe_spec, 8, 40000);
         reprobe.adaptive_n_max = 8;
-        reprobe.observe_profit_timing(0, 0.0f, 40.0f, 0.0f, 40.0f);
-        reprobe.observe_profit_acceptance(8, 7);
-        reprobe.observe_profit_timing(8, 8.0f, 30.0f, 2.0f, 40.0f);
+        reprobe.observe_profit_timing(0, 0, 0, 0.0f, 40.0f, 0.0f, 40.0f);
+        observe_profit_cycle(reprobe, 8, 8, 7, 40.0f);
         assert(!reprobe.profit_should_probe_baseline());
-        reprobe.observe_profit_timing(8, 8.0f, 30.0f, 2.0f, 40.0f);
-        reprobe.observe_profit_timing(8, 8.0f, 30.0f, 2.0f, 40.0f);
+        observe_profit_cycle(reprobe, 8, 8, 7, 40.0f);
+        observe_profit_cycle(reprobe, 8, 8, 7, 40.0f);
         assert(reprobe.profit_should_probe_baseline());
         reprobe.profit_mark_baseline_probe();
         assert(reprobe.adaptive_n_max == 0);
         assert(reprobe.profit_baseline_probe_pending);
-        reprobe.observe_profit_timing(0, 0.0f, 42.0f, 0.0f, 42.0f);
+        reprobe.observe_profit_timing(0, 0, 0, 0.0f, 42.0f, 0.0f, 42.0f);
         assert(!reprobe.profit_should_probe_baseline());
         assert(reprobe.decide_profit_n_max(8) == 8);
     }
@@ -432,10 +466,67 @@ int main() {
         early_spec.p_min = 0.0f;
         early.reset_profit_if_config_changed(early_spec, 8, 4096);
         early.adaptive_n_max = 8;
-        early.observe_profit_timing(0, 0.0f, 40.0f, 0.0f, 40.0f);
-        early.observe_profit_acceptance(8, 7);
-        early.observe_profit_timing(8, 8.0f, 30.0f, 2.0f, 40.0f);
+        early.observe_profit_timing(0, 0, 0, 0.0f, 40.0f, 0.0f, 40.0f);
+        observe_profit_cycle(early, 8, 8, 7, 40.0f);
         assert(early.profit_should_probe_baseline());
+    }
+
+    // test lower acceptance can still be faster; controller must optimize TPS,
+    // not raw acceptance rate.
+    {
+        server_adaptive_dm_state tps;
+        tps.dm_profit_min_samples = 2;
+        tps.dm_profit_raise_margin = 0.0f;
+        tps.dm_profit_lower_margin = 0.0f;
+        tps.adaptive_n_max = 2;
+        for (int i = 0; i < 2; ++i) {
+            tps.observe_profit_timing(0, 0, 0, 0.0f, 35.0f, 0.0f, 35.0f);
+            observe_profit_cycle(tps, 2, 2, 2, 120.0f);
+            observe_profit_cycle(tps, 4, 4, 2, 100.0f);
+            observe_profit_cycle(tps, 8, 8, 1, 45.0f);
+        }
+        assert(tps.decide_profit_n_max(8) == 8);
+    }
+
+    // Off state stays off on baseline-only samples even when stale positive
+    // history looks profitable; get_n_draft_max must schedule an explicit
+    // probe before speculation can wake back up.
+    {
+        server_adaptive_dm_state off;
+        off.dm_profit_min_samples = 1;
+        off.dm_profit_raise_margin = 0.0f;
+        off.dm_profit_lower_margin = 0.0f;
+        off.adaptive_n_max = 0;
+        off.observe_profit_timing(0, 0, 0, 0.0f, 35.0f, 0.0f, 35.0f);
+        observe_profit_cycle(off, 2, 2, 2, 40.0f);
+        observe_profit_cycle(off, 4, 4, 1, 70.0f);
+        observe_profit_cycle(off, 8, 8, 5, 70.0f);
+        assert(off.decide_profit_n_max(8) == 0);
+        off.adaptive_n_max = 2;
+        observe_profit_cycle(off, 2, 2, 2, 40.0f);
+        int wake = off.decide_profit_n_max(8);
+        assert(wake == 2);
+        off.apply_profit_recommendation(wake);
+        assert(off.profit_off_probe_failures == 0);
+        assert(off.decide_profit_n_max(8) == 8);
+    }
+
+    // Failed wake probes back off the off-state probe interval instead of
+    // retrying weak DFlash every fixed interval forever.
+    {
+        server_adaptive_dm_state failed;
+        failed.dm_profit_min_samples = 1;
+        failed.dm_probe_interval = 4;
+        failed.adaptive_n_max = 2;
+        failed.profit_last_recommended_n = 0;
+        failed.observe_profit_timing(0, 0, 0, 0.0f, 20.0f, 0.0f, 20.0f);
+        observe_profit_cycle(failed, 2, 2, 0, 60.0f);
+        observe_profit_cycle(failed, 4, 4, 0, 70.0f);
+        observe_profit_cycle(failed, 8, 8, 0, 80.0f);
+        assert(failed.profit_off_probe_interval() == 4);
+        assert(failed.decide_profit_n_max(8) == 0);
+        assert(failed.profit_off_probe_failures == 1);
+        assert(failed.profit_off_probe_interval() == 8);
     }
 
     return 0;

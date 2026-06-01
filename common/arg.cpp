@@ -3803,7 +3803,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_MIN_REACH"));
     add_opt(common_arg(
         {"--spec-dm-probe-interval"}, "N",
-        string_format("cycles to wait before probing with n_max>0 when DM is disabled (default: %d)", params.speculative.dm_probe_interval),
+        string_format("minimum cycles to wait before probing with n_max>0 when DM is disabled; profit mode backs off after failed probes (default: %d)", params.speculative.dm_probe_interval),
         [](common_params & params, int value) {
             params.speculative.dm_probe_interval = std::max(1, value);
             params.speculative.note_dflash_only_arg();
@@ -3887,7 +3887,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_MIN_SAMPLES"));
     add_opt(common_arg(
         {"--spec-dm-profit-warmup"}, "N",
-        string_format("positive-depth warmup cycles after no-spec baseline seeding (default: %d, 0 = auto from --spec-dm-profit-min-samples)", params.speculative.dm_profit_warmup),
+        string_format("minimum measured samples for each initial positive-depth profit probe after no-spec baseline seeding (default: %d, 0 = --spec-dm-profit-min-samples)", params.speculative.dm_profit_warmup),
         [](common_params & params, int value) {
             if (value < 0 || value > 64) {
                 throw std::invalid_argument("spec-dm-profit-warmup must be in [0, 64]");
