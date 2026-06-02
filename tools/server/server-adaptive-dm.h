@@ -295,7 +295,6 @@ struct server_adaptive_dm_state {
         int32_t branch_budget    = -1;
         int32_t draft_topk       = -1;
         int32_t dflash_cross_ctx = -1;
-        int32_t context_bucket   = -1;
         float   draft_temp       = -1.0f;
         float   p_min            = -1.0f;
         int32_t target_top_k     = -1;
@@ -305,15 +304,6 @@ struct server_adaptive_dm_state {
         float   target_top_p     = -1.0f;
         float   target_min_p     = -1.0f;
     };
-
-    static int32_t profit_context_bucket(int32_t n_past) {
-        if (n_past < 8192)  return 0;
-        if (n_past < 16384) return 1;
-        if (n_past < 32768) return 2;
-        if (n_past < 65536) return 3;
-        if (n_past < 98304) return 4;
-        return 5;
-    }
 
     float   profit_pos_accept_ewma[PROFIT_POSITIONS] = {};
     int32_t profit_pos_samples[PROFIT_POSITIONS] = {};
@@ -402,13 +392,12 @@ struct server_adaptive_dm_state {
             int base_n_max,
             int32_t n_past,
             const common_params_sampling * sampling = nullptr) {
-        const int32_t bucket = profit_context_bucket(n_past);
+        (void) n_past;
         const profit_config_key next {
             base_n_max,
             spec.branch_budget,
             spec.draft_topk,
             spec.dflash_cross_ctx,
-            bucket,
             spec.sample_temp,
             spec.p_min,
             sampling ? sampling->top_k : -1,
@@ -424,7 +413,6 @@ struct server_adaptive_dm_state {
             profit_key.branch_budget    != next.branch_budget ||
             profit_key.draft_topk       != next.draft_topk ||
             profit_key.dflash_cross_ctx != next.dflash_cross_ctx ||
-            profit_key.context_bucket   != next.context_bucket ||
             profit_key.draft_temp       != next.draft_temp ||
             profit_key.p_min            != next.p_min ||
             profit_key.target_top_k     != next.target_top_k ||
@@ -560,9 +548,9 @@ struct server_adaptive_dm_state {
             adaptive_n_max == 0;
     }
 
-    void profit_mark_baseline_probe() {
+    void profit_mark_baseline_probe(int resume_n = -1) {
         profit_baseline_probe_pending = true;
-        profit_baseline_probe_resume_n = adaptive_n_max;
+        profit_baseline_probe_resume_n = resume_n >= 0 ? resume_n : adaptive_n_max;
         adaptive_n_max = 0;
     }
 
@@ -661,6 +649,7 @@ struct server_adaptive_dm_state {
             : (adaptive_n_max < 0
                 ? base_n_max
                 : std::clamp<int>(adaptive_n_max, 0, base_n_max));
+        const bool returning_from_baseline_probe = profit_baseline_probe_resume_n > 0;
         if (current_n == 0 && profit_baseline_probe_resume_n <= 0) {
             profit_current_score = baseline_score;
             profit_last_recommended_n = 0;
@@ -838,13 +827,15 @@ struct server_adaptive_dm_state {
             recommended = current_n;
         } else if (baseline_ready && baseline_wins) {
             profit_consecutive_below_profit++;
-            const bool disable_now = profit_consecutive_below_profit >= dm_off_dwell;
+            const bool disable_now =
+                returning_from_baseline_probe ||
+                profit_consecutive_below_profit >= dm_off_dwell;
             recommended = disable_now ? 0 : current_n;
             if (disable_now && current_n > 0) {
                 profit_off_probe_failures++;
-                LOG_INF("adaptive-dm: disabling speculative depth at ctx_bucket=%d "
+                LOG_INF("adaptive-dm: disabling speculative depth "
                         "(best_score=%.3f baseline=%.3f profit_min=%.3f below_count=%d)\n",
-                        profit_key.context_bucket, best.score, baseline_score,
+                        best.score, baseline_score,
                         dm_profit_min, profit_consecutive_below_profit);
             }
         } else {
@@ -865,6 +856,21 @@ struct server_adaptive_dm_state {
             }
         }
 
+        const bool positive_demotion =
+            current_n > 0 &&
+            recommended > 0 &&
+            recommended < current_n;
+        if (positive_demotion &&
+                baseline_ready &&
+                !returning_from_baseline_probe &&
+                !profit_baseline_probe_pending &&
+                profit_cycles_since_baseline >= std::max(1, (int) dm_off_dwell)) {
+            profit_mark_baseline_probe(current_n);
+            profit_current_score = current_ready ? current_score : best.score;
+            profit_last_recommended_n = 0;
+            return 0;
+        }
+
         recommended = std::clamp(recommended, 0, base_n_max);
         profit_current_score = best.score;
         profit_last_recommended_n = recommended;
@@ -872,12 +878,11 @@ struct server_adaptive_dm_state {
 
         LOG_DBG("profit decide: current_n=%d best_n=%d rec=%d "
                 "best_ready=%d best_est=%d best_score=%.3f "
-                "curr_ready=%d curr_score=%.3f base_n=%d bucket=%d\n",
+                "curr_ready=%d curr_score=%.3f base_n=%d\n",
                 current_n, best.n, recommended,
                 best.ready ? 1 : 0, best.estimated ? 1 : 0,
                 best.score,
-                current_ready ? 1 : 0, current_score, base_n_max,
-                profit_key.context_bucket);
+                current_ready ? 1 : 0, current_score, base_n_max);
 
         return recommended;
     }

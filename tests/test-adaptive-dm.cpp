@@ -142,7 +142,6 @@ int main() {
     state.profit_key.branch_budget = 0;
     state.profit_key.draft_topk = 1;
     state.profit_key.dflash_cross_ctx = 1024;
-    state.profit_key.context_bucket = 0;
     state.profit_key.draft_temp = 0.0f;
     state.profit_key.p_min = 0.0f;
     state.profit_pending = true;
@@ -327,30 +326,39 @@ int main() {
     assert(state.profit_depth[2].samples == 0);
     assert(state.adaptive_n_max == -1);
 
-    // test a bucket transition resets profit stats and forces a new cold-start baseline
+    // Context position alone is not a configuration boundary. The profit
+    // controller must not use fixed context buckets that force relearning at
+    // arbitrary positions in a long-context model.
     {
-        server_adaptive_dm_state bucket;
-        common_params_speculative bucket_spec;
-        bucket_spec.n_max = 16;
-        bucket_spec.branch_budget = 0;
-        bucket_spec.draft_topk = 1;
-        bucket_spec.dflash_cross_ctx = 1024;
-        bucket_spec.sample_temp = 0.0f;
-        bucket_spec.p_min = 0.0f;
+        server_adaptive_dm_state position;
+        common_params_speculative position_spec;
+        position_spec.n_max = 16;
+        position_spec.branch_budget = 0;
+        position_spec.draft_topk = 1;
+        position_spec.dflash_cross_ctx = 1024;
+        position_spec.sample_temp = 0.0f;
+        position_spec.p_min = 0.0f;
 
-        bucket.reset_profit_if_config_changed(bucket_spec, 16, 1000);
-        bucket.observe_profit_timing(0, 0, 0, 0.0f, 30.0f, 0.0f, 30.0f);
-        bucket.observe_profit_timing(0, 0, 0, 0.0f, 31.0f, 0.0f, 31.0f);
-        bucket.observe_profit_timing(0, 0, 0, 0.0f, 32.0f, 0.0f, 32.0f);
-        bucket.apply_profit_recommendation(14);
-        assert(bucket.profit_baseline_ready());
-        assert(!bucket.profit_expects_baseline_sample());
+        position.reset_profit_if_config_changed(position_spec, 16, 900);
+        position.observe_profit_timing(0, 0, 0, 0.0f, 30.0f, 0.0f, 30.0f);
+        position.observe_profit_timing(0, 0, 0, 0.0f, 31.0f, 0.0f, 31.0f);
+        position.observe_profit_timing(0, 0, 0, 0.0f, 32.0f, 0.0f, 32.0f);
+        position.apply_profit_recommendation(14);
+        observe_profit_cycle(position, 14, 14, 10, 72.0f);
 
-        bucket.reset_profit_if_config_changed(bucket_spec, 16, 9000);
-        assert(bucket.adaptive_n_max == -1);
-        assert(!bucket.profit_baseline_ready());
-        assert(bucket.profit_expects_baseline_sample());
-        assert(bucket.decide_profit_n_max(16) == 0);
+        position.reset_profit_if_config_changed(position_spec, 16, 1200);
+        assert(position.adaptive_n_max == 14);
+        assert(position.profit_baseline_ready());
+        assert(position.profit_depth[14].samples == 1);
+        assert(!position.profit_baseline_probe_pending);
+        assert(!position.profit_expects_baseline_sample());
+
+        position.reset_profit_if_config_changed(position_spec, 16, 64000);
+        assert(position.adaptive_n_max == 14);
+        assert(position.profit_baseline_ready());
+        assert(position.profit_depth[14].samples == 1);
+        assert(!position.profit_baseline_probe_pending);
+        assert(!position.profit_expects_baseline_sample());
     }
 
     // test cross-depth estimation
@@ -474,6 +482,35 @@ int main() {
         early.observe_profit_timing(0, 0, 0, 0.0f, 40.0f, 0.0f, 40.0f);
         observe_profit_cycle(early, 8, 8, 7, 40.0f);
         assert(early.profit_should_probe_baseline());
+    }
+
+    // A positive-depth demotion while running on an old baseline should first
+    // remeasure no-spec, then use that fresh baseline immediately.
+    {
+        server_adaptive_dm_state stale;
+        stale.dm_profit_min_samples = 1;
+        stale.dm_off_dwell = 4;
+        stale.dm_profit_raise_margin = 0.0f;
+        stale.dm_profit_lower_margin = 0.0f;
+        stale.dm_profit_ewma_alpha = 1.0f;
+        stale.adaptive_n_max = 15;
+
+        stale.observe_profit_timing(0, 0, 0, 0.0f, 50.0f, 0.0f, 50.0f);
+        observe_profit_cycle(stale, 4, 4, 0, 80.0f);
+        observe_profit_cycle(stale, 8, 8, 0, 100.0f);
+        observe_profit_cycle(stale, 12, 12, 2, 70.0f);
+        for (int i = 0; i < 4; ++i) {
+            observe_profit_cycle(stale, 15, 15, 0, 90.0f);
+        }
+
+        const int reprobe = stale.decide_profit_n_max(15);
+        assert(reprobe == 0);
+        assert(stale.profit_baseline_probe_pending);
+        assert(stale.profit_baseline_probe_resume_n == 15);
+
+        stale.observe_profit_timing(0, 0, 0, 0.0f, 24.0f, 0.0f, 24.0f);
+        const int after = stale.decide_profit_n_max(15);
+        assert(after == 0);
     }
 
     // test lower acceptance can still be faster; controller must optimize TPS,
