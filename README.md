@@ -257,25 +257,25 @@ Target model: [Gemma 4 31B Q4_K_S](https://huggingface.co/unsloth/gemma-4-31b-it
 
 ## KV Cache Quantization
 
-K and V cache types are set independently with `--cache-type-k` and `--cache-type-v`. For benchmark details, see [KV Cache Quantization Benchmarks for Long Context](https://anbeeld.com/articles/kv-cache-quantization-benchmarks-for-long-context).
+K and V cache types are set independently with `--cache-type-k` and `--cache-type-v`. For the preset rationale and benchmark details, see [KV Cache Quantization Benchmarks for Long Context](https://anbeeld.com/articles/kv-cache-quantization-benchmarks-for-long-context).
 
 ### Preset Ladder
 
 | K / V | % of bf16 size | 99.9% precision | What it is for |
 | --- | ---: | ---: | --- |
-| bf16 / bf16 | 100 | 100.0% | Preserving full quality |
-| q8_0 / q8_0 | 53.1 | 94.6% | Validation and blame-isolation mode |
-| **q8_0 / q6_0** | **46.9** | **94.3%** | **Recommended high-end preset** |
-| q8_0 / q5_1 | 45.3 | 94.2% | Fallback if q6_0 V is unavailable |
-| q8_0 / q5_0 | 43.8 | 93.7% | If the high-end rows miss the fit by a narrow margin |
-| q6_0 / q5_0 | 37.5 | 93.3% | Optional headroom tier between q5 and q8 K |
-| q5_0 / q5_0 | 34.4 | 93.2% | Normal quality preset |
-| **q5_0 / q4_1** | **32.8** | **92.6%** | **Best default if VRAM-constrained** |
-| q5_0 / q4_0 | 31.3 | 91.4% | If q5_0 / q4_1 misses the fit by a narrow margin |
-| q4_0 / q4_0 | 28.1 | 88.9% | Memory saving with visible precision loss |
-| q4_0 / turbo3_tcq | 24.2 | 84.9% | Smaller than q4, cleaner than symmetric turbo3_tcq |
-| **turbo3_tcq / turbo3_tcq** | **20.3** | **81.6%** | **Viable extreme-compression mode** |
-| turbo2_tcq / turbo2_tcq | 14.1 | 54.4% | Last resort: not for code, JSON, math, or tool calls |
+| bf16 / bf16 | 100.0 | 100.00% | Preserving full quality |
+| q8_0 / q8_0 | 53.1 | 94.62% | Validation and blame-isolation mode |
+| **q8_0 / q6_0** | **46.9** | **94.33%** | **Recommended high-end preset** |
+| q8_0 / q5_1 | 45.3 | 94.21% | Fallback if q6_0 V is unavailable |
+| q8_0 / q5_0 | 43.8 | 93.69% | If the high-end rows miss the fit by a narrow margin |
+| q6_0 / q5_0 | 37.5 | 93.29% | Optional headroom tier between q5 and q8 K |
+| q5_0 / q5_0 | 34.4 | 93.16% | Normal quality preset |
+| **q5_0 / q4_1** | **32.8** | **92.65%** | **Best default if VRAM-constrained** |
+| q5_0 / q4_0 | 31.3 | 91.39% | If q5_0 / q4_1 misses the fit by a narrow margin |
+| q4_0 / q4_0 | 28.1 | 88.87% | Memory saving with visible precision loss |
+| q4_0 / turbo3_tcq | 24.2 | 84.93% | Smaller than q4, cleaner than symmetric turbo3_tcq |
+| **turbo3_tcq / turbo3_tcq** | **20.3** | **81.56%** | **Viable extreme-compression mode** |
+| turbo2_tcq / turbo2_tcq | 14.1 | 54.38% | Last resort: not for code, JSON, math, or tool calls |
 
 *99.9% precision = `100 · exp(−(quantKLD − bf16KLD))` at the 99.9% KL-divergence tail.*
 
@@ -304,19 +304,22 @@ K and V cache types are set independently with `--cache-type-k` and `--cache-typ
 
 ### Prebuilt
 
-Binaries for every backend are on the [releases page](https://github.com/Anbeeld/beellama.cpp/releases):
+Current release binaries are on the [releases page](https://github.com/Anbeeld/beellama.cpp/releases):
 
 | Platform | Backend | Archive |
 | --- | --- | --- |
-| macOS | Apple Silicon Metal | `bin-macos-arm64.tar.gz` |
-| Linux x64 | CPU | `bin-ubuntu-x64.tar.gz` |
-| Linux x64 | Vulkan | `bin-ubuntu-vulkan-x64.tar.gz` |
-| Linux x64 | ROCm 7.2 | `bin-ubuntu-rocm-7.2-x64.tar.gz` |
-| Linux x64 | SYCL | `bin-ubuntu-sycl-x64.tar.gz` |
+| macOS arm64 | Metal | `bin-macos-arm64.tar.gz` |
+| Ubuntu x64 | CPU | `bin-ubuntu-x64.tar.gz` |
+| Ubuntu arm64 | CPU | `bin-ubuntu-arm64.tar.gz` |
+| Ubuntu x64 | CUDA 12.4 | `bin-ubuntu-cuda-12.4-x64.tar.gz` |
+| Ubuntu x64 | CUDA 13.1 | `bin-ubuntu-cuda-13.1-x64.tar.gz` |
+| Ubuntu x64 | Vulkan | `bin-ubuntu-vulkan-x64.tar.gz` |
+| Ubuntu x64 | ROCm 7.2 | `bin-ubuntu-rocm-7.2-x64.tar.gz` |
+| Ubuntu x64 | SYCL | `bin-ubuntu-sycl-x64.tar.gz` |
 | Windows x64 | CPU | `bin-win-cpu-x64.zip` |
 | Windows x64 | SYCL | `bin-win-sycl-x64.zip` |
-| Windows x64 | CUDA 12 | `bin-win-cuda-12.4-x64.zip` |
-| Windows x64 | CUDA 13 | `bin-win-cuda-13.1-x64.zip` |
+| Windows x64 | CUDA 12.4 | `bin-win-cuda-12.4-x64.zip` |
+| Windows x64 | CUDA 13.1 | `bin-win-cuda-13.1-x64.zip` |
 | Windows x64 | HIP/Radeon | `bin-win-hip-radeon-x64.zip` |
 
 Windows CUDA archives contain a `ggml-cuda.dll` backend; download the matching `cudart-win-cuda-*-x64.zip` runtime archive and extract it into the same folder. Windows SYCL and HIP archives ship as standalone packages with all required runtime DLLs bundled.
@@ -325,8 +328,8 @@ Docker images are published to `ghcr.io/anbeeld/beellama.cpp`:
 
 | Image | Acceleration | Platforms |
 | --- | --- | --- |
-| `server-cpu` | CPU | linux/amd64, linux/arm64 |
-| `server-cuda12` | CUDA 12.4 | linux/amd64 |
+| `server`, `server-cpu` | CPU | linux/amd64, linux/arm64 |
+| `server-cuda`, `server-cuda12` | CUDA 12.4 | linux/amd64 |
 | `server-cuda13` | CUDA 13.1 | linux/amd64 |
 | `server-rocm` | ROCm | linux/amd64 |
 | `server-vulkan` | Vulkan | linux/amd64 |

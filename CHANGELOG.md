@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.1
+
+- Merged latest upstream llama.cpp master. This pulls in Gemma 4 12B and Gemma 4 unified multimodal support fixes, including non-causal vision, unified audio/vision projector handling, and FPE fixes; Qwen3.5 post-norm hidden-state behavior for MTP; CUDA KV-cache quantization preallocation and PDL race fixes; WebGPU FlashAttention refactoring with standardized quantization support; CPU backend improvements for RVV/SVE; lower-latency Metal command-buffer status polling; Mermaid diagram rendering and preview support in `tools/ui`; updated BoringSSL, SYCL documentation, save/load-state tests, Docker docs, and small CI/release maintenance.
+- Repaired CUDA fused TurboQuant FlashAttention for same-type `turbo2`, `turbo3`, and `turbo4` K/V caches. The fused MMA path now loads each supported format correctly, while mixed TurboQuant and TCQ pairs stay on the established non-fused paths; TurboQuant/TCQ partial KV offload now fails early instead of falling back to an incompatible CPU cache and reaching a scheduler crash. Added `GGML_TURBO_FA_DEBUG=1` path diagnostics and regression coverage for the supported dispatch matrix.
+- Updated release packaging and documentation. HIP/ROCm builds now include all quantized FlashAttention combinations, and the prebuilt binary and Docker image lists reflect the current release outputs.
+
 ## v0.3.0
 
 - Updated to a much newer llama.cpp base. The upstream refresh brings native MTP speculative decoding, parallel drafting and backend sampling work, the unified `llama` app, newer server/API behavior, the `tools/ui` Web UI restructure, model and converter additions, multimodal improvements, and backend gains across CUDA/HIP, Metal, Vulkan, SYCL, OpenCL, WebGPU, Hexagon, ZenDNN, and SpacemiT.
