@@ -1,125 +1,127 @@
-name: Build Packages
+name: Release
 
 on:
-  push:
-    branches:
-      - "v*"
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
+      source_ref:
+        description: "Branch or tag name that requested the build"
+        required: true
+        type: string
+      source_sha:
+        description: "Exact commit SHA to build"
+        required: true
+        type: string
       tag_name:
-        description: "Release/package tag name to use, for example v0.3.0"
-        required: false
+        description: "Release/package version name, for example v0.3.0"
+        required: true
         type: string
       publish_release:
-        description: "Create or update the GitHub release for tag_name"
-        required: false
+        description: "Create or update the GitHub release and release Docker tags"
+        required: true
         default: false
-        type: boolean
-      wait_for_docker:
-        description: "When publishing a release, wait for the matching Docker workflow to succeed"
-        required: false
-        default: true
         type: boolean
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+  group: ${{ github.workflow }}-${{ inputs.source_ref || github.ref }}
+  cancel-in-progress: ${{ inputs.publish_release != true }}
 
 env:
   CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
 
 jobs:
   release-meta:
-    name: Package metadata
+    name: Release metadata
     runs-on: ubuntu-24.04
     outputs:
+      source_ref: ${{ steps.meta.outputs.source_ref }}
+      source_sha: ${{ steps.meta.outputs.source_sha }}
       tag_name: ${{ steps.meta.outputs.tag_name }}
       build_packages: ${{ steps.meta.outputs.build_packages }}
       create_release: ${{ steps.meta.outputs.create_release }}
-      wait_docker: ${{ steps.meta.outputs.wait_docker }}
+      publish_docker: ${{ steps.meta.outputs.publish_docker }}
+      image_repo: ${{ steps.meta.outputs.image_repo }}
+      ref_name_safe: ${{ steps.meta.outputs.ref_name_safe }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
     steps:
       - name: Clone
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - name: Resolve package metadata
+      - name: Resolve release metadata
         id: meta
         shell: bash
         run: |
           set -euo pipefail
 
-          short_sha="${GITHUB_SHA::12}"
-          ref_name_safe="${GITHUB_REF_NAME//\//-}"
-          exact_tag="$(git tag --points-at "${GITHUB_SHA}" --list 'v*' | sort -V | tail -n 1 || true)"
-          build_packages="false"
-          create_release="false"
-          wait_docker="true"
-          input_tag_name="${INPUT_TAG_NAME:-}"
-          input_publish_release="${INPUT_PUBLISH_RELEASE:-false}"
-          input_wait_docker="${INPUT_WAIT_DOCKER:-true}"
-
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            tag_name="${GITHUB_REF_NAME}"
-          elif [[ "${GITHUB_REF}" == "refs/heads/main" && -n "${exact_tag}" ]]; then
-            tag_name="${exact_tag}"
-          else
-            tag_name="${ref_name_safe}-${short_sha}"
+          source_ref="${INPUT_SOURCE_REF}"
+          source_sha="${INPUT_SOURCE_SHA}"
+          tag_name="${INPUT_TAG_NAME}"
+          create_release="${INPUT_PUBLISH_RELEASE}"
+          build_packages="true"
+          publish_docker="true"
+          short_sha="${source_sha::12}"
+          ref_name_safe="$(printf '%s' "${source_ref}" | tr '[:upper:]' '[:lower:]' | sed -E 's#[^a-z0-9_.-]+#-#g; s#^[.-]+##; s#[.-]+$##')"
+          if [[ -z "${ref_name_safe}" ]]; then
+            ref_name_safe="${short_sha}"
           fi
 
-          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
-            git fetch origin +refs/heads/main:refs/remotes/origin/main --no-tags
-            if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-              if git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
-                build_packages="true"
-                create_release="true"
-              else
-                echo "Tag ${GITHUB_REF_NAME} is not on origin/main; skipping package build."
-              fi
-            elif [[ "${GITHUB_REF}" == "refs/heads/main" && -n "${exact_tag}" ]]; then
-              build_packages="true"
-              create_release="true"
-            elif [[ "${GITHUB_REF}" == refs/heads/v* ]]; then
-              build_packages="true"
-            fi
-          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            if [[ -n "${input_tag_name}" ]]; then
-              tag_name="${input_tag_name}"
-            fi
-            build_packages="true"
-            wait_docker="${input_wait_docker}"
-            if [[ "${input_publish_release}" == "true" ]]; then
-              if [[ -z "${tag_name}" || "${tag_name}" != v* ]]; then
-                echo "Manual release publishing requires a v* tag_name input." >&2
-                exit 1
-              fi
+          if [[ -z "${source_sha}" || ! "${source_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "source_sha must be a full 40-character commit SHA." >&2
+            exit 1
+          fi
+          if ! git cat-file -e "${source_sha}^{commit}"; then
+            git fetch origin +refs/heads/"${source_ref}":refs/remotes/origin/"${source_ref}" --no-tags || true
+            git fetch origin +refs/tags/"${source_ref}":refs/tags/"${source_ref}" || true
+          fi
+          if ! git cat-file -e "${source_sha}^{commit}"; then
+            git fetch origin "${source_sha}" --no-tags
+          fi
+          git cat-file -e "${source_sha}^{commit}"
 
-              git fetch origin +refs/heads/main:refs/remotes/origin/main --no-tags
-              git fetch origin +refs/tags/"${tag_name}":refs/tags/"${tag_name}"
-              tag_commit="$(git rev-list -n 1 "${tag_name}")"
-              if git merge-base --is-ancestor "${tag_commit}" refs/remotes/origin/main; then
-                create_release="true"
-              else
-                echo "Tag ${tag_name} is not on origin/main; refusing to publish a release." >&2
-                exit 1
-              fi
+          git fetch origin +refs/heads/main:refs/remotes/origin/main --no-tags
+
+          if [[ "${create_release}" == "true" ]]; then
+            if [[ "${tag_name}" != v* ]]; then
+              echo "Release publishing requires a v* tag_name." >&2
+              exit 1
+            fi
+            git fetch origin +refs/tags/"${tag_name}":refs/tags/"${tag_name}"
+            tag_commit="$(git rev-list -n 1 "${tag_name}")"
+            if [[ "${tag_commit}" != "${source_sha}" ]]; then
+              echo "Tag ${tag_name} points to ${tag_commit}, not requested source ${source_sha}." >&2
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "${source_sha}" refs/remotes/origin/main; then
+              echo "Tag ${tag_name} is not reachable from origin/main; refusing to publish." >&2
+              exit 1
             fi
           fi
 
+          owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          repo="$(printf '%s' "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')"
+          image_repo="ghcr.io/${owner}/${repo}"
+
+          echo "source_ref=${source_ref}" >> "${GITHUB_OUTPUT}"
+          echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
           echo "tag_name=${tag_name}" >> "${GITHUB_OUTPUT}"
           echo "build_packages=${build_packages}" >> "${GITHUB_OUTPUT}"
           echo "create_release=${create_release}" >> "${GITHUB_OUTPUT}"
-          echo "wait_docker=${wait_docker}" >> "${GITHUB_OUTPUT}"
+          echo "publish_docker=${publish_docker}" >> "${GITHUB_OUTPUT}"
+          echo "image_repo=${image_repo}" >> "${GITHUB_OUTPUT}"
+          echo "ref_name_safe=${ref_name_safe}" >> "${GITHUB_OUTPUT}"
+          echo "short_sha=${short_sha}" >> "${GITHUB_OUTPUT}"
+          echo "Using source ref: ${source_ref}"
+          echo "Using source SHA: ${source_sha}"
           echo "Using package version: ${tag_name}"
           echo "Build packages: ${build_packages}"
           echo "Publish GitHub release: ${create_release}"
-          echo "Wait for Docker workflow: ${wait_docker}"
+          echo "Publish Docker images: ${publish_docker}"
         env:
-          INPUT_TAG_NAME: ${{ inputs.tag_name || '' }}
+          INPUT_SOURCE_REF: ${{ inputs.source_ref }}
+          INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
+          INPUT_TAG_NAME: ${{ inputs.tag_name }}
           INPUT_PUBLISH_RELEASE: ${{ inputs.publish_release }}
-          INPUT_WAIT_DOCKER: ${{ inputs.wait_for_docker }}
 
   macos-arm64:
     name: macOS arm64 Metal
@@ -130,6 +132,7 @@ jobs:
       - name: Clone
         uses: actions/checkout@v6
         with:
+          ref: ${{ needs.release-meta.outputs.source_sha }}
           fetch-depth: 0
 
       - name: Setup Node.js
@@ -181,14 +184,23 @@ jobs:
           name: beellama-bin-macos-arm64.tar.gz
 
   ubuntu-cpu:
-    name: Ubuntu x64 CPU
+    name: Ubuntu ${{ matrix.build }} CPU
     needs: release-meta
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - build: x64
+            os: ubuntu-22.04
+          - build: arm64
+            os: ubuntu-24.04-arm
     steps:
       - name: Clone
         uses: actions/checkout@v6
         with:
+          ref: ${{ needs.release-meta.outputs.source_sha }}
           fetch-depth: 0
 
       - name: Setup Node.js
@@ -201,13 +213,20 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: release-ubuntu-cpu-x64
+          key: release-${{ matrix.os }}-cpu
           evict-old-files: 1d
 
       - name: Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential libssl-dev
+
+      - name: Toolchain workaround
+        if: ${{ contains(matrix.os, 'ubuntu-24.04') }}
+        run: |
+          sudo apt-get install -y gcc-14 g++-14
+          echo "CC=gcc-14" >> "${GITHUB_ENV}"
+          echo "CXX=g++-14" >> "${GITHUB_ENV}"
 
       - name: Build
         run: |
@@ -228,21 +247,22 @@ jobs:
 
       - name: Smoke package binaries
         run: |
+          file ./build/bin/llama-server
           ./build/bin/llama-server --version
           ./build/bin/llama-cli --version
 
       - name: Pack artifacts
         run: |
           cp LICENSE ./build/bin/
-          tar -czvf "beellama-${{ needs.release-meta.outputs.tag_name }}-bin-ubuntu-x64.tar.gz" \
+          tar -czvf "beellama-${{ needs.release-meta.outputs.tag_name }}-bin-ubuntu-${{ matrix.build }}.tar.gz" \
             --transform "s,^\.,beellama-${{ needs.release-meta.outputs.tag_name }}," \
             -C ./build/bin .
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: beellama-${{ needs.release-meta.outputs.tag_name }}-bin-ubuntu-x64.tar.gz
-          name: beellama-bin-ubuntu-x64.tar.gz
+          path: beellama-${{ needs.release-meta.outputs.tag_name }}-bin-ubuntu-${{ matrix.build }}.tar.gz
+          name: beellama-bin-ubuntu-${{ matrix.build }}.tar.gz
 
   ubuntu-vulkan:
     name: Ubuntu x64 Vulkan
@@ -253,6 +273,7 @@ jobs:
       - name: Clone
         uses: actions/checkout@v6
         with:
+          ref: ${{ needs.release-meta.outputs.source_sha }}
           fetch-depth: 0
 
       - name: Setup Node.js
@@ -323,6 +344,7 @@ jobs:
       - name: Clone
         uses: actions/checkout@v6
         with:
+          ref: ${{ needs.release-meta.outputs.source_sha }}
           fetch-depth: 0
 
       - name: Setup Node.js
@@ -419,6 +441,7 @@ jobs:
       - name: Clone
         uses: actions/checkout@v6
         with:
+          ref: ${{ needs.release-meta.outputs.source_sha }}
           fetch-depth: 0
 
       - name: Setup Node.js
@@ -515,6 +538,90 @@ jobs:
           path: beellama-${{ needs.release-meta.outputs.tag_name }}-bin-ubuntu-sycl-x64.tar.gz
           name: beellama-bin-ubuntu-sycl-x64.tar.gz
 
+  ubuntu-cuda:
+    name: Ubuntu x64 CUDA ${{ matrix.cuda }}
+    needs: release-meta
+    if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:${{ matrix.cuda_container }}
+    env:
+      CCACHE_MAXSIZE: 5G
+      CCACHE_SLOPPINESS: time_macros
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda: "12.4"
+            cuda_container: "12.4.1-devel-ubuntu22.04"
+          - cuda: "13.1"
+            cuda_container: "13.1.1-devel-ubuntu24.04"
+    steps:
+      - name: Dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates cmake ninja-build ccache git file libssl-dev libgomp1
+
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-meta.outputs.source_sha }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: "tools/ui/package-lock.json"
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: release-ubuntu-cuda-${{ matrix.cuda }}-x64
+          evict-old-files: 1d
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_FA=ON \
+            -DGGML_CUDA_FA_ALL_QUANTS=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+            ${{ env.CMAKE_ARGS }} \
+            -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined
+          cmake --build build --config Release -j "$(nproc)"
+
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats
+
+      - name: Smoke package binaries
+        run: |
+          file ./build/bin/llama-server
+          ./build/bin/llama-server --version
+          ./build/bin/llama-cli --version
+
+      - name: Pack artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          tar -czvf "beellama-${{ needs.release-meta.outputs.tag_name }}-bin-ubuntu-cuda-${{ matrix.cuda }}-x64.tar.gz" \
+            --transform "s,^\.,beellama-${{ needs.release-meta.outputs.tag_name }}," \
+            -C ./build/bin .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: beellama-${{ needs.release-meta.outputs.tag_name }}-bin-ubuntu-cuda-${{ matrix.cuda }}-x64.tar.gz
+          name: beellama-bin-ubuntu-cuda-${{ matrix.cuda }}-x64.tar.gz
+
   windows-cpu:
     name: Windows x64 CPU
     needs: release-meta
@@ -524,6 +631,7 @@ jobs:
       - name: Clone
         uses: actions/checkout@v6
         with:
+          ref: ${{ needs.release-meta.outputs.source_sha }}
           fetch-depth: 0
 
       - name: Setup Node.js
@@ -601,6 +709,9 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-meta.outputs.source_sha }}
+          fetch-depth: 0
 
       - name: Cache oneAPI installation
         id: cache-oneapi
@@ -728,6 +839,9 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-meta.outputs.source_sha }}
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -842,6 +956,9 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-meta.outputs.source_sha }}
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -942,6 +1059,7 @@ jobs:
       - ubuntu-vulkan
       - ubuntu-rocm
       - ubuntu-sycl
+      - ubuntu-cuda
       - windows-cpu
       - windows-sycl
       - windows-cuda
@@ -951,6 +1069,7 @@ jobs:
       - name: Clone
         uses: actions/checkout@v6
         with:
+          ref: ${{ needs.release-meta.outputs.source_sha }}
           fetch-depth: 0
 
       - name: Download artifacts
@@ -1017,61 +1136,26 @@ jobs:
         shell: bash
         env:
           TAG_NAME: ${{ needs.release-meta.outputs.tag_name }}
+          IMAGE_REPO: ${{ needs.release-meta.outputs.image_repo }}
         run: |
           set -euo pipefail
           release_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}"
           changelog_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md"
-          image_repo="ghcr.io/${GITHUB_REPOSITORY,,}"
           repo_name="${GITHUB_REPOSITORY#*/}"
           repo_name="${repo_name,,}"
           package_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/pkgs/container/${repo_name}"
-
-          docker_link() {
-            local tag="$1"
-            printf '[`%s:%s`](%s)' "${image_repo}" "${tag}" "${package_url}"
-          }
-
-          docker_server="$(docker_link "server-${TAG_NAME}")"
-          docker_cpu="$(docker_link "server-cpu-${TAG_NAME}")"
-          docker_cuda="$(docker_link "server-cuda-${TAG_NAME}")"
-          docker_cuda12="$(docker_link "server-cuda12-${TAG_NAME}")"
-          docker_cuda13="$(docker_link "server-cuda13-${TAG_NAME}")"
-          docker_rocm="$(docker_link "server-rocm-${TAG_NAME}")"
-          docker_vulkan="$(docker_link "server-vulkan-${TAG_NAME}")"
-          docker_sycl="$(docker_link "server-sycl-${TAG_NAME}")"
-
-          cat > release-notes.md << EOF
-          <details open>
-          <summary>Changelog</summary>
-
-          [CHANGELOG.md](${changelog_url})
-
-          </details>
-
-          **macOS:**
-          - [macOS Apple Silicon (arm64)](${release_url}/beellama-${TAG_NAME}-bin-macos-arm64.tar.gz)
-
-          **Linux:**
-          - [Ubuntu x64 (CPU)](${release_url}/beellama-${TAG_NAME}-bin-ubuntu-x64.tar.gz)
-          - [Ubuntu x64 (Vulkan)](${release_url}/beellama-${TAG_NAME}-bin-ubuntu-vulkan-x64.tar.gz)
-          - [Ubuntu x64 (ROCm 7.2)](${release_url}/beellama-${TAG_NAME}-bin-ubuntu-rocm-7.2-x64.tar.gz)
-          - [Ubuntu x64 (SYCL)](${release_url}/beellama-${TAG_NAME}-bin-ubuntu-sycl-x64.tar.gz)
-
-          **Windows:**
-          - [Windows x64 (CPU)](${release_url}/beellama-${TAG_NAME}-bin-win-cpu-x64.zip)
-          - [Windows x64 (SYCL)](${release_url}/beellama-${TAG_NAME}-bin-win-sycl-x64.zip)
-          - [Windows x64 (CUDA 12)](${release_url}/beellama-${TAG_NAME}-bin-win-cuda-12.4-x64.zip) - [CUDA 12.4 DLLs](${release_url}/beellama-${TAG_NAME}-cudart-win-cuda-12.4-x64.zip)
-          - [Windows x64 (CUDA 13)](${release_url}/beellama-${TAG_NAME}-bin-win-cuda-13.1-x64.zip) - [CUDA 13.1 DLLs](${release_url}/beellama-${TAG_NAME}-cudart-win-cuda-13.1-x64.zip)
-          - [Windows x64 (HIP)](${release_url}/beellama-${TAG_NAME}-bin-win-hip-radeon-x64.zip)
-
-          **Docker:**
-          - ${docker_server} / ${docker_cpu} (CPU, linux/amd64 + linux/arm64; usable on Apple Silicon Docker Desktop without Metal acceleration)
-          - ${docker_cuda} / ${docker_cuda12}
-          - ${docker_cuda13}
-          - ${docker_rocm}
-          - ${docker_vulkan}
-          - ${docker_sycl}
-          EOF
+          python3 scripts/extract-changelog.py \
+            --tag "${TAG_NAME}" \
+            --changelog CHANGELOG.md \
+            --fallback-url "${changelog_url}" \
+            --output changelog-fragment.md
+          python3 scripts/write-release-notes.py \
+            --tag "${TAG_NAME}" \
+            --release-url "${release_url}" \
+            --image-repo "${IMAGE_REPO}" \
+            --package-url "${package_url}" \
+            --changelog changelog-fragment.md \
+            --output release-notes.md
 
       - name: Upload release assets
         uses: actions/upload-artifact@v6
@@ -1081,72 +1165,283 @@ jobs:
             release/*
             release-notes.md
 
-  wait-docker:
-    name: Wait for Docker images
-    if: ${{ needs.release-meta.outputs.create_release == 'true' }}
+  docker-build:
+    name: Docker ${{ matrix.config.display }}
+    if: ${{ needs.release-meta.outputs.publish_docker == 'true' }}
     needs:
       - release-meta
+      - package-assets
+    runs-on: ${{ matrix.config.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: cpu-amd64
+            display: CPU amd64
+            group: cpu
+            arch: amd64
+            platform: linux/amd64
+            artifact: beellama-bin-ubuntu-x64.tar.gz
+            dockerfile: .devops/runtime-server.Dockerfile
+            base_image: ubuntu:24.04
+            runtime_packages: ca-certificates curl libgomp1
+            runs_on: ubuntu-24.04
+          - name: cpu-arm64
+            display: CPU arm64
+            group: cpu
+            arch: arm64
+            platform: linux/arm64
+            artifact: beellama-bin-ubuntu-arm64.tar.gz
+            dockerfile: .devops/runtime-server.Dockerfile
+            base_image: ubuntu:24.04
+            runtime_packages: ca-certificates curl libgomp1
+            runs_on: ubuntu-24.04-arm
+          - name: cuda12
+            display: CUDA 12.4
+            group: cuda12
+            arch: amd64
+            platform: linux/amd64
+            artifact: beellama-bin-ubuntu-cuda-12.4-x64.tar.gz
+            dockerfile: .devops/runtime-server.Dockerfile
+            base_image: nvidia/cuda:12.4.1-runtime-ubuntu22.04
+            runtime_packages: ca-certificates curl libgomp1
+            runs_on: ubuntu-24.04
+          - name: cuda13
+            display: CUDA 13.1
+            group: cuda13
+            arch: amd64
+            platform: linux/amd64
+            artifact: beellama-bin-ubuntu-cuda-13.1-x64.tar.gz
+            dockerfile: .devops/runtime-server.Dockerfile
+            base_image: nvidia/cuda:13.1.1-runtime-ubuntu24.04
+            runtime_packages: ca-certificates curl libgomp1
+            runs_on: ubuntu-24.04
+          - name: rocm
+            display: ROCm
+            group: rocm
+            arch: amd64
+            platform: linux/amd64
+            artifact: beellama-bin-ubuntu-rocm-7.2-x64.tar.gz
+            dockerfile: .devops/runtime-server.Dockerfile
+            base_image: rocm/dev-ubuntu-24.04:7.2.1-complete
+            runtime_packages: ca-certificates curl libgomp1
+            runs_on: ubuntu-24.04
+          - name: vulkan
+            display: Vulkan
+            group: vulkan
+            arch: amd64
+            platform: linux/amd64
+            artifact: beellama-bin-ubuntu-vulkan-x64.tar.gz
+            dockerfile: .devops/runtime-server.Dockerfile
+            base_image: ubuntu:24.04
+            runtime_packages: ca-certificates curl libegl1 libgl1 libgles2 libglvnd0 libglx0 libgomp1 libvulkan1 mesa-vulkan-drivers
+            runs_on: ubuntu-24.04
+          - name: sycl
+            display: SYCL
+            group: sycl
+            arch: amd64
+            platform: linux/amd64
+            artifact: beellama-bin-ubuntu-sycl-x64.tar.gz
+            dockerfile: .devops/runtime-intel-server.Dockerfile
+            base_image: unused
+            runtime_packages: unused
+            runs_on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-meta.outputs.source_sha }}
+          fetch-depth: 0
+
+      - name: Download package artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ matrix.config.artifact }}
+          path: ./package
+
+      - name: Prepare Docker context
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docker-context/app
+          tar_file="$(find package -type f -name '*.tar.gz' | head -n 1)"
+          if [[ -z "${tar_file}" ]]; then
+            echo "No tar.gz package found for ${{ matrix.config.artifact }}" >&2
+            exit 1
+          fi
+          tar -xzf "${tar_file}" -C docker-context/app --strip-components=1
+          test -x docker-context/app/llama-server
+          cp "${{ matrix.config.dockerfile }}" docker-context/Dockerfile
+          ls -lh docker-context/app/llama-server
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get build date
+        id: build_date
+        run: echo "date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push image digest
+        id: build
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
+        with:
+          context: ./docker-context
+          file: ./docker-context/Dockerfile
+          platforms: ${{ matrix.config.platform }}
+          outputs: type=image,name=${{ needs.release-meta.outputs.image_repo }},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=true
+          provenance: false
+          build-args: |
+            BASE_IMAGE=${{ matrix.config.base_image }}
+            RUNTIME_PACKAGES=${{ matrix.config.runtime_packages }}
+            BUILD_DATE=${{ steps.build_date.outputs.date }}
+            APP_VERSION=${{ needs.release-meta.outputs.tag_name }}
+            APP_REVISION=${{ needs.release-meta.outputs.source_sha }}
+            IMAGE_URL=${{ github.server_url }}/${{ github.repository }}
+            IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
+          annotations: |
+            manifest:org.opencontainers.image.created=${{ steps.build_date.outputs.date }}
+            manifest:org.opencontainers.image.version=${{ needs.release-meta.outputs.tag_name }}
+            manifest:org.opencontainers.image.revision=${{ needs.release-meta.outputs.source_sha }}
+            manifest:org.opencontainers.image.title=BeeLlama.cpp
+            manifest:org.opencontainers.image.description=BeeLlama.cpp GGUF inference with DFlash, TurboQuant, and TCQ cache types
+            manifest:org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
+            manifest:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=registry,ref=${{ needs.release-meta.outputs.image_repo }}:buildcache-runtime-${{ matrix.config.name }}
+          cache-to: type=registry,ref=${{ needs.release-meta.outputs.image_repo }}:buildcache-runtime-${{ matrix.config.name }},mode=max
+
+      - name: Record digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="${{ steps.build.outputs.digest }}"
+          if [[ -z "${digest}" ]]; then
+            echo "Docker build did not return a digest." >&2
+            exit 1
+          fi
+          mkdir -p /tmp/docker-digests
+          printf '%s\t%s\t%s\n' "${{ matrix.config.group }}" "${{ matrix.config.arch }}" "${digest}" > "/tmp/docker-digests/${{ matrix.config.name }}.tsv"
+
+      - name: Upload digest metadata
+        uses: actions/upload-artifact@v6
+        with:
+          name: docker-digest-${{ matrix.config.name }}
+          path: /tmp/docker-digests/${{ matrix.config.name }}.tsv
+          if-no-files-found: error
+
+  docker-merge:
+    name: Docker tags ${{ matrix.config.display }}
+    if: ${{ needs.release-meta.outputs.publish_docker == 'true' }}
+    needs:
+      - release-meta
+      - docker-build
     runs-on: ubuntu-24.04
     permissions:
-      actions: read
       contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - group: cpu
+            display: CPU
+            platforms: linux/amd64 linux/arm64
+            tag_suffixes: none -cpu
+          - group: cuda12
+            display: CUDA 12.4
+            platforms: linux/amd64
+            tag_suffixes: -cuda -cuda12
+          - group: cuda13
+            display: CUDA 13.1
+            platforms: linux/amd64
+            tag_suffixes: -cuda13
+          - group: rocm
+            display: ROCm
+            platforms: linux/amd64
+            tag_suffixes: -rocm
+          - group: vulkan
+            display: Vulkan
+            platforms: linux/amd64
+            tag_suffixes: -vulkan
+          - group: sycl
+            display: SYCL
+            platforms: linux/amd64
+            tag_suffixes: -sycl
     steps:
-      - name: Wait for Docker workflow
+      - name: Download digest metadata
+        uses: actions/download-artifact@v7
+        with:
+          pattern: docker-digest-*
+          path: /tmp/docker-digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Docker tags
+        shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ github.sha }}
-          REF_NAME: ${{ github.ref_name }}
+          IMAGE_REPO: ${{ needs.release-meta.outputs.image_repo }}
           TAG_NAME: ${{ needs.release-meta.outputs.tag_name }}
-          WAIT_DOCKER: ${{ needs.release-meta.outputs.wait_docker }}
+          RELEASE_TAGS: ${{ needs.release-meta.outputs.create_release }}
+          REF_NAME_SAFE: ${{ needs.release-meta.outputs.ref_name_safe }}
+          SHORT_SHA: ${{ needs.release-meta.outputs.short_sha }}
+          GROUP: ${{ matrix.config.group }}
+          PLATFORMS: ${{ matrix.config.platforms }}
+          TAG_SUFFIXES: ${{ matrix.config.tag_suffixes }}
         run: |
           set -euo pipefail
 
-          if [[ "${WAIT_DOCKER}" != "true" ]]; then
-            echo "Skipping Docker workflow wait."
-            exit 0
+          digest_glob="/tmp/docker-digests/*.tsv"
+          if ! ls ${digest_glob} >/dev/null 2>&1; then
+            echo "No Docker digest metadata found." >&2
+            exit 1
           fi
 
-          deadline=$((SECONDS + 19800))
-          while (( SECONDS < deadline )); do
-            run_info=""
-            for event_name in push workflow_dispatch; do
-              run_info="$(
-                gh run list \
-                  --repo "${GITHUB_REPOSITORY}" \
-                  --workflow docker.yml \
-                  --commit "${HEAD_SHA}" \
-                  --event "${event_name}" \
-                  --json databaseId,status,conclusion,headBranch,url,createdAt \
-                  --limit 20 \
-                  --jq "map(select(.headBranch == \"${TAG_NAME}\" or .headBranch == \"${REF_NAME}\" or .headBranch == \"\" or .headBranch == null)) | sort_by(.createdAt) | reverse | .[0] | select(. != null) | [.databaseId, .status, (.conclusion // \"\"), .url] | @tsv"
-              )"
-              if [[ -n "${run_info}" ]]; then
-                break
-              fi
-            done
-
-            if [[ -z "${run_info}" ]]; then
-              echo "Waiting for Docker workflow run for ${TAG_NAME} (${HEAD_SHA})..."
-              sleep 30
-              continue
-            fi
-
-            IFS=$'\t' read -r run_id status conclusion url <<< "${run_info}"
-            echo "Docker workflow run ${run_id}: status=${status} conclusion=${conclusion:-pending} ${url}"
-
-            if [[ "${status}" == "completed" ]]; then
-              if [[ "${conclusion}" == "success" ]]; then
-                exit 0
-              fi
-              echo "Docker workflow did not succeed: ${conclusion}" >&2
+          sources=()
+          for platform in ${PLATFORMS}; do
+            arch="${platform#linux/}"
+            digest="$(awk -F '\t' -v g="${GROUP}" -v a="${arch}" '$1 == g && $2 == a { print $3; exit }' ${digest_glob})"
+            if [[ -z "${digest}" ]]; then
+              echo "Missing digest for group=${GROUP} arch=${arch}" >&2
               exit 1
             fi
-
-            sleep 30
+            sources+=("${IMAGE_REPO}@${digest}")
           done
 
-          echo "Timed out waiting for Docker workflow for ${TAG_NAME} (${HEAD_SHA})." >&2
-          exit 1
+          tag_args=()
+          for suffix in ${TAG_SUFFIXES}; do
+            if [[ "${suffix}" == "none" ]]; then
+              suffix=""
+            fi
+            if [[ "${RELEASE_TAGS}" == "true" ]]; then
+              tag_args+=("-t" "${IMAGE_REPO}:server${suffix}")
+              tag_args+=("-t" "${IMAGE_REPO}:server${suffix}-${TAG_NAME}")
+            else
+              tag_args+=("-t" "${IMAGE_REPO}:server${suffix}-${REF_NAME_SAFE}-dev")
+              tag_args+=("-t" "${IMAGE_REPO}:server${suffix}-${REF_NAME_SAFE}-${SHORT_SHA}")
+            fi
+          done
+
+          printf 'Creating Docker tags:\n'
+          printf '  %s\n' "${tag_args[@]}"
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
 
   release:
     name: Publish GitHub release
@@ -1154,11 +1449,29 @@ jobs:
     needs:
       - release-meta
       - package-assets
-      - wait-docker
+      - docker-merge
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify release tag
+        env:
+          TAG_NAME: ${{ needs.release-meta.outputs.tag_name }}
+          SOURCE_SHA: ${{ needs.release-meta.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin +refs/tags/"${TAG_NAME}":refs/tags/"${TAG_NAME}"
+          tag_commit="$(git rev-list -n 1 "${TAG_NAME}")"
+          if [[ "${tag_commit}" != "${SOURCE_SHA}" ]]; then
+            echo "Tag ${TAG_NAME} moved from ${SOURCE_SHA} to ${tag_commit}; refusing to publish." >&2
+            exit 1
+          fi
+
       - name: Download release assets
         uses: actions/download-artifact@v7
         with:
